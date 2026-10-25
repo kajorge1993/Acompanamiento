@@ -58,7 +58,7 @@ jobs:
 
           let zonaHorariaBogota: TimeZone = TimeZone(identifier: "America/Bogota") ?? TimeZone.current
 
-          let calendarioCO: Calendar = {
+          let calendarCO: Calendar = {
               var c = Calendar(identifier: .gregorian)
               c.firstWeekday = 2
               c.timeZone = zonaHorariaBogota
@@ -1753,7 +1753,7 @@ jobs:
               }
 
               private func existente(_ lunes: Date) -> Schedule? {
-                  return store.data.schedules.first(where: { calendarioCO.isDate($0.weekStart, inSameDayAs: lunes) })
+                  return store.data.schedules.first(where: { calendarCO.isDate($0.weekStart, inSameDayAs: lunes) })
               }
 
               var body: some View {
@@ -2250,6 +2250,7 @@ jobs:
           codesign --force --deep --sign - "$APP"
           ditto -c -k --sequesterRsrc --keepParent "$APP" Acompanamiento.zip
           ls -la Acompanamiento.zip
+
 
       - uses: actions/upload-artifact@v4
         with:
