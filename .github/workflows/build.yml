@@ -1,0 +1,2257 @@
+name: Build Mac App
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - name: Crear proyecto
+        run: |
+          set -e
+          mkdir -p proj/Sources
+          cd proj
+          cat > Package.swift <<'EOF_FILE'
+          // swift-tools-version:5.9
+          import PackageDescription
+
+          let package = Package(
+              name: "Acompanamiento",
+              platforms: [.macOS(.v13)],
+              targets: [
+                  .executableTarget(name: "Acompanamiento", path: "Sources")
+              ]
+          )
+          EOF_FILE
+          cat > Sources/App.swift <<'EOF_FILE'
+          import SwiftUI
+
+          @main
+          struct AcompanamientoApp: App {
+              @StateObject private var store = Store()
+
+              var body: some Scene {
+                  WindowGroup {
+                      ContentView()
+                          .environmentObject(store)
+                          .frame(minWidth: 1050, minHeight: 680)
+                  }
+              }
+          }
+          EOF_FILE
+          cat > Sources/Models.swift <<'EOF_FILE'
+          import Foundation
+          import SwiftUI
+          import AppKit
+
+          let diasNombre = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes"]
+
+          let zonasIniciales = [
+              "Bloque Coordinación y Baños Mujeres",
+              "Cancha Principal y Zona de Mesas",
+              "Bloque Fotocopiadora y Baños Hombres",
+              "Bloque Primaria y Tienda"
+          ]
+
+          let zonaHorariaBogota: TimeZone = TimeZone(identifier: "America/Bogota") ?? TimeZone.current
+
+          let calendarioCO: Calendar = {
+              var c = Calendar(identifier: .gregorian)
+              c.firstWeekday = 2
+              c.timeZone = zonaHorariaBogota
+              c.locale = Locale(identifier: "es_CO")
+              return c
+          }()
+
+          func formateador(_ patron: String) -> DateFormatter {
+              let f = DateFormatter()
+              f.locale = Locale(identifier: "es_CO")
+              f.timeZone = zonaHorariaBogota
+              f.dateFormat = patron
+              return f
+          }
+
+          func fechaLarga(_ d: Date) -> String { formateador("d 'de' MMMM 'de' yyyy").string(from: d) }
+          func fechaDia(_ d: Date) -> String { formateador("d 'de' MMMM").string(from: d) }
+          func fechaCorta(_ d: Date) -> String { formateador("dd/MM/yyyy").string(from: d) }
+
+          func mondayOf(_ d: Date) -> Date {
+              let c = calendarCO
+              let inicio = c.startOfDay(for: d)
+              let wd = c.component(.weekday, from: inicio)
+              let desplazamiento = (wd + 5) % 7
+              return c.date(byAdding: .day, value: -desplazamiento, to: inicio) ?? inicio
+          }
+
+          func addDays(_ d: Date, _ n: Int) -> Date {
+              return calendarCO.date(byAdding: .day, value: n, to: d) ?? d
+          }
+
+          struct IdRef: Identifiable {
+              let id: UUID
+          }
+
+          struct Absence: Codable, Identifiable, Hashable {
+              var id = UUID()
+              var start: Date
+              var end: Date
+              var note: String = ""
+          }
+
+          struct Teacher: Codable, Identifiable, Hashable {
+              var id = UUID()
+              var name: String
+              var day: Int
+              var active: Bool = true
+              var absences: [Absence] = []
+          }
+
+          struct Zone: Codable, Identifiable, Hashable {
+              var id = UUID()
+              var name: String
+              var active: Bool = true
+          }
+
+          struct Assignment: Codable, Identifiable, Hashable {
+              var id = UUID()
+              var teacherId: UUID
+              var day: Int
+              var zoneId: UUID?
+              var absent: Bool = false
+          }
+
+          struct Ronda: Codable, Hashable {
+              var a: UUID? = nil
+              var b: UUID? = nil
+          }
+
+          struct Schedule: Codable, Identifiable, Hashable {
+              var id = UUID()
+              var weekStart: Date
+              var jornada: String
+              var assignments: [Assignment]
+              var rondas: [Ronda]
+              var published: Bool = false
+              var notes: String = ""
+              var warnings: [String] = []
+
+              func ronda(_ d: Int) -> Ronda {
+                  return d >= 0 && d < rondas.count ? rondas[d] : Ronda()
+              }
+          }
+
+          struct Settings: Codable {
+              var institution = "Institución Educativa Técnico Industrial Pedro Antonio Molina (IETIPAM)"
+              var sede = "Jorge Eliécer Gaitán"
+              var jornada = "Mañana"
+              var observation = "Todos los docentes del día correspondiente deberán acompañar el ingreso y la salida de los estudiantes, con el fin de hacer seguimiento al uniforme y la presentación personal de los estudiantes."
+              var pin = ""
+          }
+
+          struct AppData: Codable {
+              var teachers: [Teacher] = []
+              var zones: [Zone] = zonasIniciales.map { Zone(name: $0) }
+              var schedules: [Schedule] = []
+              var settings = Settings()
+          }
+
+          func makeEncoder() -> JSONEncoder {
+              let e = JSONEncoder()
+              e.dateEncodingStrategy = .iso8601
+              e.outputFormatting = [.prettyPrinted]
+              return e
+          }
+
+          func makeDecoder() -> JSONDecoder {
+              let d = JSONDecoder()
+              d.dateDecodingStrategy = .iso8601
+              return d
+          }
+
+          func normalizar(_ d: AppData) -> AppData {
+              var x = d
+              for i in x.schedules.indices {
+                  while x.schedules[i].rondas.count < 5 {
+                      x.schedules[i].rondas.append(Ronda())
+                  }
+              }
+              return x
+          }
+
+          final class Store: ObservableObject {
+              @Published var data: AppData {
+                  didSet { guardar() }
+              }
+              @Published var unlocked = false
+              @Published var requestedWeek: Date? = nil
+              private let url: URL
+
+              init() {
+                  let fm = FileManager.default
+                  let raiz = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+                      ?? URL(fileURLWithPath: NSTemporaryDirectory())
+                  let carpeta = raiz.appendingPathComponent("Acompanamiento", isDirectory: true)
+                  try? fm.createDirectory(at: carpeta, withIntermediateDirectories: true)
+                  let archivo = carpeta.appendingPathComponent("datos.json")
+                  url = archivo
+                  if let crudo = try? Data(contentsOf: archivo),
+                     let leido = try? makeDecoder().decode(AppData.self, from: crudo) {
+                      data = normalizar(leido)
+                  } else {
+                      data = AppData()
+                  }
+              }
+
+              private func guardar() {
+                  do {
+                      let crudo = try makeEncoder().encode(data)
+                      try crudo.write(to: url, options: .atomic)
+                  } catch {
+                      print("No se pudo guardar: \(error)")
+                  }
+              }
+
+              func exportarCopia(a destino: URL) throws {
+                  try makeEncoder().encode(data).write(to: destino)
+              }
+
+              func restaurarCopia(de origen: URL) throws {
+                  let crudo = try Data(contentsOf: origen)
+                  data = normalizar(try makeDecoder().decode(AppData.self, from: crudo))
+              }
+
+              func nombreDocente(_ id: UUID?) -> String {
+                  guard let id = id else { return "—" }
+                  return data.teachers.first(where: { $0.id == id })?.name ?? "—"
+              }
+
+              func nombreZona(_ id: UUID?) -> String {
+                  guard let id = id else { return "Sin zona" }
+                  return data.zones.first(where: { $0.id == id })?.name ?? "Sin zona"
+              }
+          }
+
+          func nombreDocente(_ id: UUID?, _ data: AppData) -> String {
+              guard let id = id else { return "—" }
+              return data.teachers.first(where: { $0.id == id })?.name ?? "—"
+          }
+
+          func nombreZona(_ id: UUID?, _ data: AppData) -> String {
+              guard let id = id else { return "Sin zona" }
+              return data.zones.first(where: { $0.id == id })?.name ?? "Sin zona"
+          }
+
+          func etiquetaSemana(_ s: Schedule) -> String {
+              return "Semana del \(fechaDia(s.weekStart)) al \(fechaLarga(addDays(s.weekStart, 4)))"
+          }
+          EOF_FILE
+          cat > Sources/Scheduler.swift <<'EOF_FILE'
+          import Foundation
+
+          // MARK: - Historial
+
+          struct HistoryStats {
+              var count = 0
+              var zoneVisits: [UUID: [UUID: Int]] = [:]
+              var zoneLast: [UUID: [UUID: Int]] = [:]
+              var rondaCount: [UUID: Int] = [:]
+              var rondaLast: [UUID: Int] = [:]
+              var pairCount: [String: Int] = [:]
+              var pairLast: [String: Int] = [:]
+          }
+
+          func pairKey(_ a: UUID, _ b: UUID) -> String {
+              let x = a.uuidString
+              let y = b.uuidString
+              return x < y ? x + "|" + y : y + "|" + x
+          }
+
+          func buildHistory(_ schedules: [Schedule], before: Date?, excluding: UUID? = nil) -> HistoryStats {
+              var h = HistoryStats()
+              var lista: [Schedule] = []
+              for s in schedules {
+                  if !s.published { continue }
+                  if let ex = excluding, s.id == ex { continue }
+                  if let limite = before, s.weekStart >= limite { continue }
+                  lista.append(s)
+              }
+              lista.sort { $0.weekStart < $1.weekStart }
+              for (i, s) in lista.enumerated() {
+                  h.count += 1
+                  let pos = i + 1
+                  for a in s.assignments {
+                      if a.absent { continue }
+                      guard let z = a.zoneId else { continue }
+                      h.zoneVisits[a.teacherId, default: [:]][z, default: 0] += 1
+                      h.zoneLast[a.teacherId, default: [:]][z] = pos
+                  }
+                  for r in s.rondas {
+                      if let a = r.a {
+                          h.rondaCount[a, default: 0] += 1
+                          h.rondaLast[a] = pos
+                      }
+                      if let b = r.b {
+                          h.rondaCount[b, default: 0] += 1
+                          h.rondaLast[b] = pos
+                      }
+                      if let a = r.a, let b = r.b {
+                          let k = pairKey(a, b)
+                          h.pairCount[k, default: 0] += 1
+                          h.pairLast[k] = pos
+                      }
+                  }
+              }
+              return h
+          }
+
+          func isAbsent(_ t: Teacher, on date: Date) -> Bool {
+              let c = calendarCO
+              let d = c.startOfDay(for: date)
+              for a in t.absences {
+                  if c.startOfDay(for: a.start) <= d && d <= c.startOfDay(for: a.end) { return true }
+              }
+              return false
+          }
+
+          // MARK: - Algoritmo húngaro (asignación de costo mínimo)
+
+          func hungarian(_ a: [[Int]]) -> [Int] {
+              let n = a.count
+              if n == 0 { return [] }
+              let m = a[0].count
+              let INF = Int.max / 4
+              var u = [Int](repeating: 0, count: n + 1)
+              var v = [Int](repeating: 0, count: m + 1)
+              var p = [Int](repeating: 0, count: m + 1)
+              var way = [Int](repeating: 0, count: m + 1)
+              for i in 1...n {
+                  p[0] = i
+                  var j0 = 0
+                  var minv = [Int](repeating: INF, count: m + 1)
+                  var used = [Bool](repeating: false, count: m + 1)
+                  repeat {
+                      used[j0] = true
+                      let i0 = p[j0]
+                      var delta = INF
+                      var j1 = 0
+                      for j in 1...m {
+                          if !used[j] {
+                              let cur = a[i0 - 1][j - 1] - u[i0] - v[j]
+                              if cur < minv[j] {
+                                  minv[j] = cur
+                                  way[j] = j0
+                              }
+                              if minv[j] < delta {
+                                  delta = minv[j]
+                                  j1 = j
+                              }
+                          }
+                      }
+                      for j in 0...m {
+                          if used[j] {
+                              u[p[j]] += delta
+                              v[j] -= delta
+                          } else {
+                              minv[j] -= delta
+                          }
+                      }
+                      j0 = j1
+                  } while p[j0] != 0
+                  repeat {
+                      let j1 = way[j0]
+                      p[j0] = p[j1]
+                      j0 = j1
+                  } while j0 != 0
+              }
+              var ans = [Int](repeating: -1, count: n)
+              for j in 1...m {
+                  if p[j] != 0 { ans[p[j] - 1] = j - 1 }
+              }
+              return ans
+          }
+
+          // MARK: - Costos
+
+          func costoZona(_ t: UUID, _ z: UUID, _ h: HistoryStats) -> Int {
+              var c = (h.zoneVisits[t]?[z] ?? 0) * 1000
+              if let last = h.zoneLast[t]?[z] {
+                  let hace = h.count + 1 - last
+                  c += max(0, 40 - hace) * 10
+              }
+              return c
+          }
+
+          func costoPareja(_ a: UUID, _ b: UUID, _ h: HistoryStats) -> Int {
+              let k = pairKey(a, b)
+              var c = (h.pairCount[k] ?? 0) * 800
+              if let last = h.pairLast[k] {
+                  let hace = h.count + 1 - last
+                  if hace == 1 {
+                      c += 50000
+                  } else if hace <= 8 {
+                      c += (9 - hace) * 100
+                  }
+              }
+              return c
+          }
+
+          // MARK: - Ronda general (asignación conjunta de toda la semana)
+
+          func asignarRondas(docentes: [Teacher], lunes: Date, hist: HistoryStats) -> (rondas: [Ronda], avisos: [String]) {
+              var avisos: [String] = []
+              var vacias: [Ronda] = []
+              for _ in 0..<5 { vacias.append(Ronda()) }
+              if docentes.count < 2 {
+                  avisos.append("Ronda general: se necesitan al menos dos docentes habilitados.")
+                  return (vacias, avisos)
+              }
+              let FORB = 1_000_000_000
+              let copias = max(1, (10 + docentes.count - 1) / docentes.count)
+              var columnas: [(Int, Int)] = []
+              for c in 0..<copias {
+                  for ti in 0..<docentes.count { columnas.append((ti, c)) }
+              }
+              var permitido: [[Bool]] = []
+              for t in docentes {
+                  var fila: [Bool] = []
+                  for d in 0..<5 {
+                      fila.append(t.day != d && !isAbsent(t, on: addDays(lunes, d)))
+                  }
+                  permitido.append(fila)
+              }
+              var costos: [[Int]] = []
+              for d in 0..<5 {
+                  for _ in 0..<2 {
+                      var fila: [Int] = []
+                      for (ti, c) in columnas {
+                          if !permitido[ti][d] {
+                              fila.append(FORB)
+                          } else {
+                              let t = docentes[ti]
+                              var base = (hist.rondaCount[t.id] ?? 0) * 1000
+                              if let last = hist.rondaLast[t.id] {
+                                  base += max(0, 20 - (hist.count + 1 - last)) * 20
+                              }
+                              fila.append(base + c * 100000)
+                          }
+                      }
+                      costos.append(fila)
+                  }
+              }
+              let sol = hungarian(costos)
+              var elegidos: [Int?] = []
+              var hayHuecos = false
+              for (i, j) in sol.enumerated() {
+                  if j < 0 || costos[i][j] >= FORB {
+                      elegidos.append(nil)
+                      hayHuecos = true
+                  } else {
+                      elegidos.append(columnas[j].0)
+                  }
+              }
+              var resultado = vacias
+              if hayHuecos {
+                  for d in 0..<5 {
+                      let x = elegidos[d * 2]
+                      let y = elegidos[d * 2 + 1]
+                      resultado[d] = Ronda(a: x == nil ? nil : docentes[x!].id, b: y == nil ? nil : docentes[y!].id)
+                      if x == nil || y == nil {
+                          avisos.append("Ronda general del \(diasNombre[d].lowercased()): no hay suficientes docentes disponibles.")
+                      }
+                  }
+                  return (resultado, avisos)
+              }
+              // Reacomodar los 10 elegidos en parejas por día para evitar parejas repetidas
+              var disponibles: [Int] = []
+              for e in elegidos { if let x = e { disponibles.append(x) } }
+              var mejorCosto = Int.max
+              var mejorArreglo: [(Int, Int)] = []
+              var actual: [(Int, Int)] = []
+              func dfs(_ d: Int, _ resto: [Int], _ costo: Int) {
+                  if costo >= mejorCosto { return }
+                  if d == 5 {
+                      mejorCosto = costo
+                      mejorArreglo = actual
+                      return
+                  }
+                  for i in 0..<resto.count {
+                      for j in (i + 1)..<resto.count {
+                          let a = resto[i]
+                          let b = resto[j]
+                          if a == b || !permitido[a][d] || !permitido[b][d] { continue }
+                          var sobra = resto
+                          sobra.remove(at: j)
+                          sobra.remove(at: i)
+                          actual.append((a, b))
+                          dfs(d + 1, sobra, costo + costoPareja(docentes[a].id, docentes[b].id, hist))
+                          actual.removeLast()
+                      }
+                  }
+              }
+              dfs(0, disponibles, 0)
+              if mejorArreglo.count == 5 {
+                  for d in 0..<5 {
+                      resultado[d] = Ronda(a: docentes[mejorArreglo[d].0].id, b: docentes[mejorArreglo[d].1].id)
+                  }
+              } else {
+                  for d in 0..<5 {
+                      resultado[d] = Ronda(a: docentes[elegidos[d * 2]!].id, b: docentes[elegidos[d * 2 + 1]!].id)
+                  }
+              }
+              return (resultado, avisos)
+          }
+
+          // MARK: - Generación de la semana
+
+          func generarSemana(_ data: AppData, weekStart: Date, jornada: String) -> Schedule {
+              let lunes = mondayOf(weekStart)
+              let hist = buildHistory(data.schedules, before: lunes)
+              let zonas = data.zones.filter { $0.active }
+              let docentes = data.teachers.filter { $0.active }
+              var asignaciones: [Assignment] = []
+              var avisos: [String] = []
+
+              if zonas.isEmpty { avisos.append("No hay zonas activas: no se pueden asignar zonas.") }
+
+              for d in 0..<5 {
+                  let fecha = addDays(lunes, d)
+                  let delDia = docentes.filter { $0.day == d }.sorted { $0.name < $1.name }
+                  var ausentes: [Teacher] = []
+                  var presentes: [Teacher] = []
+                  for t in delDia {
+                      if isAbsent(t, on: fecha) { ausentes.append(t) } else { presentes.append(t) }
+                  }
+                  for t in ausentes {
+                      asignaciones.append(Assignment(teacherId: t.id, day: d, zoneId: nil, absent: true))
+                  }
+                  if !ausentes.isEmpty {
+                      let nombres = ausentes.map { $0.name }.joined(separator: ", ")
+                      avisos.append("\(diasNombre[d]): ausentes \(nombres). Su zona debe cubrirse manualmente.")
+                  }
+                  if zonas.isEmpty || presentes.isEmpty { continue }
+
+                  let n = presentes.count
+                  let k = zonas.count
+                  var cupos: [Int] = []
+                  if n >= k {
+                      let base = n / k
+                      let extra = n % k
+                      let desfase = hist.count % k
+                      for zi in 0..<k {
+                          let orden = (zi - desfase + k) % k
+                          let cantidad = base + (orden < extra ? 1 : 0)
+                          for _ in 0..<cantidad { cupos.append(zi) }
+                      }
+                  } else {
+                      cupos = Array(0..<k)
+                  }
+                  var costos: [[Int]] = []
+                  for t in presentes {
+                      costos.append(cupos.map { zi in costoZona(t.id, zonas[zi].id, hist) })
+                  }
+                  let sol = hungarian(costos)
+                  for (i, t) in presentes.enumerated() {
+                      let zi = cupos[sol[i]]
+                      asignaciones.append(Assignment(teacherId: t.id, day: d, zoneId: zonas[zi].id, absent: false))
+                  }
+              }
+
+              let r = asignarRondas(docentes: docentes, lunes: lunes, hist: hist)
+              avisos.append(contentsOf: r.avisos)
+
+              return Schedule(weekStart: lunes, jornada: jornada, assignments: asignaciones, rondas: r.rondas, warnings: avisos)
+          }
+
+          // MARK: - Validación
+
+          enum Nivel { case ok, aviso, error }
+
+          struct Hallazgo: Identifiable {
+              let id = UUID()
+              let nivel: Nivel
+              let texto: String
+          }
+
+          func validar(_ s: Schedule, _ data: AppData) -> [Hallazgo] {
+              var out: [Hallazgo] = []
+              let hist = buildHistory(data.schedules, before: s.weekStart, excluding: s.id)
+              let zonasActivas = data.zones.filter { $0.active }
+
+              func docente(_ id: UUID?) -> Teacher? {
+                  guard let id = id else { return nil }
+                  return data.teachers.first(where: { $0.id == id })
+              }
+              func nombre(_ id: UUID?) -> String { return docente(id)?.name ?? "—" }
+              func zona(_ id: UUID?) -> String { return nombreZona(id, data) }
+              func agregar(_ n: Nivel, _ t: String) { out.append(Hallazgo(nivel: n, texto: t)) }
+
+              for w in s.warnings { agregar(.aviso, w) }
+
+              // 1. Día fijo
+              var problemas = 0
+              for a in s.assignments {
+                  if let t = docente(a.teacherId), t.day != a.day {
+                      problemas += 1
+                      agregar(.error, "\(t.name) está programado el \(diasNombre[a.day]) pero su día fijo es el \(diasNombre[t.day]).")
+                  }
+              }
+              if problemas == 0 { agregar(.ok, "Cada docente conserva su día fijo.") }
+
+              // 2. Rotación de zonas
+              problemas = 0
+              for a in s.assignments {
+                  if a.absent { continue }
+                  guard let z = a.zoneId, let t = docente(a.teacherId), !zonasActivas.isEmpty else { continue }
+                  let visitas = zonasActivas.map { hist.zoneVisits[t.id]?[$0.id] ?? 0 }
+                  let minimo = visitas.min() ?? 0
+                  let aqui = hist.zoneVisits[t.id]?[z] ?? 0
+                  if aqui > minimo {
+                      problemas += 1
+                      agregar(.aviso, "\(t.name) repite «\(zona(z))» antes de recorrer todas las zonas.")
+                  } else if let u = hist.zoneLast[t.id]?[z], hist.count + 1 - u == 1, zonasActivas.count > 1 {
+                      problemas += 1
+                      agregar(.aviso, "\(t.name) repite la misma zona de la semana anterior.")
+                  }
+              }
+              if problemas == 0 { agregar(.ok, "La rotación de zonas es correcta.") }
+
+              // 3. Asignaciones incompatibles
+              problemas = 0
+              var vistos = Set<String>()
+              for a in s.assignments {
+                  let k = a.teacherId.uuidString + "-\(a.day)"
+                  if vistos.contains(k) {
+                      problemas += 1
+                      agregar(.error, "\(nombre(a.teacherId)) tiene dos zonas el mismo día.")
+                  }
+                  vistos.insert(k)
+              }
+              for d in 0..<5 {
+                  let r = s.ronda(d)
+                  var ids: [UUID] = []
+                  if let a = r.a { ids.append(a) }
+                  if let b = r.b { ids.append(b) }
+                  if Set(ids).count != ids.count {
+                      problemas += 1
+                      agregar(.error, "El \(diasNombre[d].lowercased()) el mismo docente aparece dos veces en la ronda general.")
+                  }
+                  for id in ids {
+                      if s.assignments.contains(where: { $0.day == d && $0.teacherId == id }) {
+                          problemas += 1
+                          agregar(.error, "\(nombre(id)) tiene zona y ronda general el \(diasNombre[d].lowercased()).")
+                      }
+                  }
+              }
+              if problemas == 0 { agregar(.ok, "No hay asignaciones simultáneas incompatibles.") }
+
+              // 4. Dos docentes por día en la ronda general
+              problemas = 0
+              for d in 0..<5 {
+                  let r = s.ronda(d)
+                  if r.a == nil || r.b == nil {
+                      problemas += 1
+                      agregar(.error, "La ronda general del \(diasNombre[d].lowercased()) no tiene dos docentes.")
+                  }
+              }
+              if problemas == 0 { agregar(.ok, "Cada día tiene exactamente dos docentes en la ronda general.") }
+
+              // 5. Parejas repetidas
+              problemas = 0
+              for d in 0..<5 {
+                  let r = s.ronda(d)
+                  if let a = r.a, let b = r.b, let last = hist.pairLast[pairKey(a, b)] {
+                      let hace = hist.count + 1 - last
+                      if hace == 1 {
+                          problemas += 1
+                          agregar(.aviso, "\(nombre(a)) y \(nombre(b)) repiten pareja de la semana anterior.")
+                      } else if hace <= 8 {
+                          problemas += 1
+                          agregar(.aviso, "\(nombre(a)) y \(nombre(b)) ya hicieron ronda juntos hace \(hace) semanas.")
+                      }
+                  }
+              }
+              if problemas == 0 { agregar(.ok, "Las parejas de ronda general no se repiten en el historial reciente.") }
+
+              // 6. Ausencias y restricciones
+              problemas = 0
+              for a in s.assignments {
+                  if let t = docente(a.teacherId), !a.absent, isAbsent(t, on: addDays(s.weekStart, a.day)) {
+                      problemas += 1
+                      agregar(.error, "\(t.name) tiene una novedad registrada el \(diasNombre[a.day].lowercased()) y aparece asignado.")
+                  }
+              }
+              for d in 0..<5 {
+                  let r = s.ronda(d)
+                  for id in [r.a, r.b] {
+                      if let t = docente(id), isAbsent(t, on: addDays(s.weekStart, d)) {
+                          problemas += 1
+                          agregar(.error, "\(t.name) tiene una novedad registrada el \(diasNombre[d].lowercased()) y está en la ronda general.")
+                      } else if let t = docente(id), !t.active {
+                          problemas += 1
+                          agregar(.aviso, "\(t.name) está desactivado y aparece en la ronda general.")
+                      }
+                  }
+              }
+              if problemas == 0 { agregar(.ok, "Se respetaron las ausencias y novedades registradas.") }
+
+              // 7. Equidad
+              var cuenta: [UUID: Int] = hist.rondaCount
+              for d in 0..<5 {
+                  let r = s.ronda(d)
+                  if let a = r.a { cuenta[a, default: 0] += 1 }
+                  if let b = r.b { cuenta[b, default: 0] += 1 }
+              }
+              let activos = data.teachers.filter { $0.active }
+              var equilibrado = true
+              if activos.count > 1 {
+                  let vals = activos.map { cuenta[$0.id] ?? 0 }
+                  if let mx = vals.max(), let mn = vals.min(), mx - mn > 1 {
+                      equilibrado = false
+                      agregar(.aviso, "La ronda general está desigual: entre \(mn) y \(mx) participaciones por docente.")
+                  }
+              }
+              if equilibrado { agregar(.ok, "La ronda general está distribuida de forma equitativa.") }
+
+              // 8. Cobertura de zonas
+              problemas = 0
+              for d in 0..<5 {
+                  let hay = data.teachers.contains(where: { $0.active && $0.day == d })
+                  if !hay {
+                      problemas += 1
+                      agregar(.aviso, "No hay docentes con día fijo el \(diasNombre[d].lowercased()): las zonas quedan sin cobertura.")
+                      continue
+                  }
+                  for z in zonasActivas {
+                      let cubierta = s.assignments.contains(where: { $0.day == d && $0.zoneId == z.id && !$0.absent })
+                      if !cubierta {
+                          problemas += 1
+                          agregar(.aviso, "\(diasNombre[d]): la zona «\(z.name)» no tiene docente.")
+                      }
+                  }
+              }
+              if problemas == 0 { agregar(.ok, "Todas las zonas activas tienen cobertura todos los días.") }
+
+              return out
+          }
+
+          // MARK: - Pruebas automáticas (simulación de 8 semanas)
+
+          func datosDePrueba(_ porDia: [Int], _ base: AppData) -> AppData {
+              var d = base
+              d.schedules = []
+              d.teachers = []
+              var n = 1
+              for (dia, cantidad) in porDia.enumerated() {
+                  for _ in 0..<cantidad {
+                      d.teachers.append(Teacher(name: String(format: "Docente %02d", n), day: dia))
+                      n += 1
+                  }
+              }
+              return d
+          }
+
+          @MainActor
+          func simularEscenario(_ titulo: String, _ entrada: AppData, semanas: Int = 8) -> [String] {
+              var d = entrada
+              d.schedules = []
+              d.teachers = d.teachers.map { t in
+                  var x = t
+                  x.absences = []
+                  return x
+              }
+              var rep: [String] = ["", "▶︎ \(titulo)"]
+              let activos = d.teachers.filter { $0.active }
+              let zonasActivas = d.zones.filter { $0.active }
+              if activos.isEmpty || zonasActivas.isEmpty {
+                  rep.append("❌ Faltan docentes o zonas activas para simular.")
+                  return rep
+              }
+              let inicio = mondayOf(Date())
+              for w in 0..<semanas {
+                  var s = generarSemana(d, weekStart: addDays(inicio, 7 * w), jornada: d.settings.jornada)
+                  s.published = true
+                  d.schedules.append(s)
+              }
+              rep.append("Semanas simuladas: \(semanas)")
+
+              var malDia = 0
+              for s in d.schedules {
+                  for a in s.assignments {
+                      if let t = d.teachers.first(where: { $0.id == a.teacherId }), t.day != a.day { malDia += 1 }
+                  }
+              }
+              rep.append(malDia == 0 ? "✅ Cada docente conservó su día fijo todas las semanas." : "❌ \(malDia) asignaciones cambiaron de día.")
+
+              var repetidas = 0
+              for t in activos {
+                  var visitadas = Set<UUID>()
+                  for s in d.schedules {
+                      for a in s.assignments where a.teacherId == t.id && !a.absent {
+                          guard let z = a.zoneId else { continue }
+                          if visitadas.contains(z) && visitadas.count < zonasActivas.count { repetidas += 1 }
+                          visitadas.insert(z)
+                          if visitadas.count >= zonasActivas.count { visitadas.removeAll() }
+                      }
+                  }
+              }
+              rep.append(repetidas == 0 ? "✅ Las zonas rotaron sin repetirse antes de completar el ciclo." : "⚠️ \(repetidas) repeticiones de zona antes de completar el ciclo (posible por el número de docentes por día).")
+
+              var rondaMal = 0
+              for s in d.schedules {
+                  for dd in 0..<5 {
+                      let r = s.ronda(dd)
+                      if r.a == nil || r.b == nil || r.a == r.b { rondaMal += 1 }
+                  }
+              }
+              rep.append(rondaMal == 0 ? "✅ Cada día tuvo dos docentes distintos en la ronda general." : "❌ \(rondaMal) días sin dos docentes en la ronda general.")
+
+              var consecutivas = 0
+              var repetidasOcho = 0
+              var ultimaVez: [String: Int] = [:]
+              var previas = Set<String>()
+              for (w, s) in d.schedules.enumerated() {
+                  var actuales = Set<String>()
+                  for dd in 0..<5 {
+                      let r = s.ronda(dd)
+                      if let a = r.a, let b = r.b { actuales.insert(pairKey(a, b)) }
+                  }
+                  consecutivas += actuales.intersection(previas).count
+                  for k in actuales {
+                      if let u = ultimaVez[k], w - u <= 8 { repetidasOcho += 1 }
+                      ultimaVez[k] = w
+                  }
+                  previas = actuales
+              }
+              rep.append(consecutivas == 0 ? "✅ Ninguna pareja de ronda se repitió en semanas consecutivas." : "⚠️ \(consecutivas) parejas repetidas en semanas consecutivas.")
+              rep.append(repetidasOcho == 0 ? "✅ No hubo parejas repetidas dentro de las 8 semanas." : "⚠️ \(repetidasOcho) repeticiones de pareja dentro de las \(semanas) semanas (inevitable con pocos docentes).")
+
+              var cuenta: [UUID: Int] = [:]
+              for s in d.schedules {
+                  for dd in 0..<5 {
+                      let r = s.ronda(dd)
+                      if let a = r.a { cuenta[a, default: 0] += 1 }
+                      if let b = r.b { cuenta[b, default: 0] += 1 }
+                  }
+              }
+              let vals = activos.map { cuenta[$0.id] ?? 0 }
+              if let mx = vals.max(), let mn = vals.min() {
+                  rep.append(mx - mn <= 1 ? "✅ Ronda general equitativa: entre \(mn) y \(mx) participaciones por docente." : "⚠️ Ronda general desigual: entre \(mn) y \(mx) participaciones.")
+              }
+
+              var errores = 0
+              for s in d.schedules {
+                  errores += validar(s, d).filter { $0.nivel == .error }.count
+              }
+              rep.append(errores == 0 ? "✅ Sin asignaciones incompatibles ni reglas rotas." : "❌ \(errores) errores de validación.")
+
+              if let ultima = d.schedules.last {
+                  let temp = FileManager.default.temporaryDirectory
+                  let pdf = temp.appendingPathComponent("prueba-\(UUID().uuidString).pdf")
+                  let xlsx = temp.appendingPathComponent("prueba-\(UUID().uuidString).xlsx")
+                  let okPDF = exportarPDF(VistaImprimible(s: ultima, data: d), a: pdf)
+                  var okXLSX = false
+                  do {
+                      try escribirXLSX(filas: tablaCompleta(ultima, d), hoja: "Acompañamiento", destino: xlsx)
+                      okXLSX = true
+                  } catch {
+                      okXLSX = false
+                  }
+                  let tamPDF = tamanoArchivo(pdf)
+                  let tamXLSX = tamanoArchivo(xlsx)
+                  rep.append(okPDF && tamPDF > 0 ? "✅ Exportación a PDF funciona." : "❌ Falló la exportación a PDF.")
+                  rep.append(okXLSX && tamXLSX > 0 ? "✅ Exportación a Excel funciona." : "❌ Falló la exportación a Excel.")
+                  try? FileManager.default.removeItem(at: pdf)
+                  try? FileManager.default.removeItem(at: xlsx)
+              }
+              return rep
+          }
+
+          @MainActor
+          func ejecutarPruebas(_ real: AppData) -> String {
+              var lineas: [String] = ["PRUEBAS DE SIMULACIÓN (8 semanas consecutivas)"]
+              lineas.append(contentsOf: simularEscenario("20 docentes, 4 por día (caso ideal)", datosDePrueba([4, 4, 4, 4, 4], real)))
+              lineas.append(contentsOf: simularEscenario("20 docentes repartidos 6-5-4-3-2 (caso irregular)", datosDePrueba([6, 5, 4, 3, 2], real)))
+              if real.teachers.contains(where: { $0.active }) {
+                  lineas.append(contentsOf: simularEscenario("Tus docentes registrados", real))
+              }
+              lineas.append("")
+              lineas.append("Nota: si una regla es imposible con el número de docentes de un día, la app la marca como aviso y propone la mejor distribución posible.")
+              return lineas.joined(separator: "\n")
+          }
+
+          func tamanoArchivo(_ u: URL) -> Int {
+              let attrs = try? FileManager.default.attributesOfItem(atPath: u.path)
+              if let n = attrs?[.size] as? NSNumber { return n.intValue }
+              return 0
+          }
+          EOF_FILE
+          cat > Sources/Exporter.swift <<'EOF_FILE'
+          import Foundation
+          import SwiftUI
+          import AppKit
+          import PDFKit
+
+          // MARK: - Tabla de texto
+
+          func tablaTexto(_ s: Schedule, _ data: AppData) -> [[String]] {
+              var filas: [[String]] = [["Nombre del docente", "Día de la semana", "Zona asignada"]]
+              for d in 0..<5 {
+                  let etiqueta = "\(diasNombre[d]) \(fechaDia(addDays(s.weekStart, d)))"
+                  for a in s.assignments where a.day == d {
+                      filas.append([nombreDocente(a.teacherId, data), etiqueta, a.absent ? "Ausente (sin zona)" : nombreZona(a.zoneId, data)])
+                  }
+                  let r = s.ronda(d)
+                  filas.append([nombreDocente(r.a, data), etiqueta, "Ronda general"])
+                  filas.append([nombreDocente(r.b, data), etiqueta, "Ronda general"])
+              }
+              return filas
+          }
+
+          func tablaCompleta(_ s: Schedule, _ data: AppData) -> [[String]] {
+              var filas: [[String]] = []
+              filas.append([data.settings.institution])
+              filas.append(["Sede: \(data.settings.sede)", "Jornada: \(s.jornada)"])
+              filas.append(["Semana del \(fechaLarga(s.weekStart)) al \(fechaLarga(addDays(s.weekStart, 4)))"])
+              filas.append([""])
+              filas.append(contentsOf: tablaTexto(s, data))
+              filas.append([""])
+              filas.append(["Observaciones: " + data.settings.observation])
+              return filas
+          }
+
+          func csvLinea(_ cols: [String]) -> String {
+              return cols.map { "\"" + $0.replacingOccurrences(of: "\"", with: "\"\"") + "\"" }.joined(separator: ";")
+          }
+
+          func csvTexto(_ s: Schedule, _ data: AppData) -> String {
+              let lineas = tablaCompleta(s, data).map { csvLinea($0) }
+              return "\u{FEFF}" + lineas.joined(separator: "\r\n")
+          }
+
+          func nombreArchivoBase(_ s: Schedule) -> String {
+              return "Acompanamiento_" + formateador("yyyy-MM-dd").string(from: s.weekStart)
+          }
+
+          // MARK: - Excel (.xlsx) sin librerías externas
+
+          func escaparXML(_ s: String) -> String {
+              var r = s.replacingOccurrences(of: "&", with: "&amp;")
+              r = r.replacingOccurrences(of: "<", with: "&lt;")
+              r = r.replacingOccurrences(of: ">", with: "&gt;")
+              r = r.replacingOccurrences(of: "\"", with: "&quot;")
+              return r
+          }
+
+          func letraColumna(_ i: Int) -> String {
+              let letras = Array("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+              return String(letras[min(max(i, 0), 25)])
+          }
+
+          func escribirXLSX(filas: [[String]], hoja: String, destino: URL) throws {
+              let fm = FileManager.default
+              let tmp = fm.temporaryDirectory.appendingPathComponent("xlsx-" + UUID().uuidString)
+              try fm.createDirectory(at: tmp.appendingPathComponent("_rels"), withIntermediateDirectories: true)
+              try fm.createDirectory(at: tmp.appendingPathComponent("xl/_rels"), withIntermediateDirectories: true)
+              try fm.createDirectory(at: tmp.appendingPathComponent("xl/worksheets"), withIntermediateDirectories: true)
+
+              let cabecera = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
+              let tipos = cabecera + "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">"
+                  + "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>"
+                  + "<Default Extension=\"xml\" ContentType=\"application/xml\"/>"
+                  + "<Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>"
+                  + "<Override PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>"
+                  + "</Types>"
+              let rels = cabecera + "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+                  + "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/>"
+                  + "</Relationships>"
+              let libro = cabecera + "<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">"
+                  + "<sheets><sheet name=\"" + escaparXML(String(hoja.prefix(30))) + "\" sheetId=\"1\" r:id=\"rId1\"/></sheets></workbook>"
+              let relsLibro = cabecera + "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+                  + "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/>"
+                  + "</Relationships>"
+
+              var datos = ""
+              for (i, fila) in filas.enumerated() {
+                  datos += "<row r=\"\(i + 1)\">"
+                  for (j, celda) in fila.enumerated() {
+                      datos += "<c r=\"\(letraColumna(j))\(i + 1)\" t=\"inlineStr\"><is><t>" + escaparXML(celda) + "</t></is></c>"
+                  }
+                  datos += "</row>"
+              }
+              let hojaXML = cabecera + "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">"
+                  + "<cols><col min=\"1\" max=\"1\" width=\"44\" customWidth=\"1\"/><col min=\"2\" max=\"2\" width=\"30\" customWidth=\"1\"/><col min=\"3\" max=\"3\" width=\"40\" customWidth=\"1\"/></cols>"
+                  + "<sheetData>" + datos + "</sheetData></worksheet>"
+
+              try tipos.write(to: tmp.appendingPathComponent("[Content_Types].xml"), atomically: true, encoding: .utf8)
+              try rels.write(to: tmp.appendingPathComponent("_rels/.rels"), atomically: true, encoding: .utf8)
+              try libro.write(to: tmp.appendingPathComponent("xl/workbook.xml"), atomically: true, encoding: .utf8)
+              try relsLibro.write(to: tmp.appendingPathComponent("xl/_rels/workbook.xml.rels"), atomically: true, encoding: .utf8)
+              try hojaXML.write(to: tmp.appendingPathComponent("xl/worksheets/sheet1.xml"), atomically: true, encoding: .utf8)
+
+              if fm.fileExists(atPath: destino.path) { try fm.removeItem(at: destino) }
+              let p = Process()
+              p.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+              p.arguments = ["-c", "-k", "--norsrc", tmp.path, destino.path]
+              try p.run()
+              p.waitUntilExit()
+              try? fm.removeItem(at: tmp)
+              if p.terminationStatus != 0 {
+                  throw NSError(domain: "xlsx", code: Int(p.terminationStatus), userInfo: [NSLocalizedDescriptionKey: "No se pudo crear el archivo de Excel."])
+              }
+          }
+
+          // MARK: - PDF, impresión y portapapeles
+
+          @MainActor
+          func exportarPDF<V: View>(_ vista: V, a url: URL) -> Bool {
+              let renderer = ImageRenderer(content: vista)
+              renderer.proposedSize = ProposedViewSize(width: 700, height: nil)
+              var ok = false
+              renderer.render { size, dibujar in
+                  var caja = CGRect(x: 0, y: 0, width: size.width, height: size.height)
+                  guard let ctx = CGContext(url as CFURL, mediaBox: &caja, nil) else { return }
+                  ctx.beginPDFPage(nil)
+                  dibujar(ctx)
+                  ctx.endPDFPage()
+                  ctx.closePDF()
+                  ok = true
+              }
+              return ok
+          }
+
+          @MainActor
+          func imprimirSemana(_ s: Schedule, _ data: AppData) {
+              let url = FileManager.default.temporaryDirectory.appendingPathComponent("Acompanamiento-\(UUID().uuidString).pdf")
+              if exportarPDF(VistaImprimible(s: s, data: data), a: url) {
+                  if let doc = PDFDocument(url: url),
+                     let op = doc.printOperation(for: NSPrintInfo.shared, scalingMode: .pageScaleToFit, autoRotate: true) {
+                      _ = op.run()
+                  } else {
+                      NSWorkspace.shared.open(url)
+                  }
+              }
+          }
+
+          func copiarTabla(_ s: Schedule, _ data: AppData) {
+              let texto = tablaTexto(s, data).map { $0.joined(separator: "\t") }.joined(separator: "\n")
+              let pb = NSPasteboard.general
+              pb.clearContents()
+              pb.setString(texto, forType: .string)
+          }
+
+          @MainActor
+          func pedirGuardar(nombre: String, _ accion: (URL) -> Void) {
+              let p = NSSavePanel()
+              p.nameFieldStringValue = nombre
+              p.canCreateDirectories = true
+              if p.runModal() == .OK, let u = p.url { accion(u) }
+          }
+
+          @MainActor
+          func pedirAbrir(_ accion: (URL) -> Void) {
+              let p = NSOpenPanel()
+              p.canChooseFiles = true
+              p.canChooseDirectories = false
+              p.allowsMultipleSelection = false
+              if p.runModal() == .OK, let u = p.url { accion(u) }
+          }
+
+          // MARK: - Vista imprimible (PDF / impresión)
+
+          struct VistaImprimible: View {
+              let s: Schedule
+              let data: AppData
+
+              var body: some View {
+                  VStack(alignment: .leading, spacing: 8) {
+                      Text(data.settings.institution).font(.system(size: 17, weight: .bold))
+                      Text("Sede \(data.settings.sede) · Jornada de la \(s.jornada.lowercased())").font(.system(size: 13))
+                      Text("Semana del \(fechaLarga(s.weekStart)) al \(fechaLarga(addDays(s.weekStart, 4)))").font(.system(size: 13, weight: .semibold))
+                      ForEach(0..<5, id: \.self) { d in
+                          bloque(d)
+                      }
+                      Text("Observaciones").font(.system(size: 13, weight: .bold)).padding(.top, 6)
+                      Text(data.settings.observation).font(.system(size: 12))
+                  }
+                  .padding(28)
+                  .frame(width: 700, alignment: .leading)
+                  .background(Color.white)
+                  .foregroundColor(.black)
+                  .environment(\.colorScheme, .light)
+              }
+
+              private func bloque(_ d: Int) -> some View {
+                  VStack(alignment: .leading, spacing: 0) {
+                      Text("\(diasNombre[d]) \(fechaDia(addDays(s.weekStart, d)))")
+                          .font(.system(size: 13, weight: .bold))
+                          .padding(6)
+                          .frame(maxWidth: .infinity, alignment: .leading)
+                          .background(Color(red: 0.84, green: 0.89, blue: 0.98))
+                      ForEach(s.assignments.filter { $0.day == d }) { a in
+                          fila(nombreDocente(a.teacherId, data), a.absent ? "Ausente (sin zona)" : nombreZona(a.zoneId, data), negrita: false)
+                      }
+                      fila("Ronda general", nombreDocente(s.ronda(d).a, data) + " y " + nombreDocente(s.ronda(d).b, data), negrita: true)
+                  }
+                  .overlay(Rectangle().stroke(Color.gray.opacity(0.5), lineWidth: 0.7))
+              }
+
+              private func fila(_ izq: String, _ der: String, negrita: Bool) -> some View {
+                  HStack(alignment: .top) {
+                      Text(izq).font(.system(size: 12, weight: negrita ? .bold : .regular)).frame(width: 250, alignment: .leading)
+                      Text(der).font(.system(size: 12, weight: negrita ? .bold : .regular)).frame(maxWidth: .infinity, alignment: .leading)
+                  }
+                  .padding(.horizontal, 6)
+                  .padding(.vertical, 3)
+              }
+          }
+          EOF_FILE
+          cat > Sources/Views.swift <<'EOF_FILE'
+          import SwiftUI
+          import AppKit
+
+          // MARK: - Estructura general
+
+          enum Seccion: String, CaseIterable, Identifiable {
+              case inicio = "Panel de inicio"
+              case docentes = "Gestión de docentes"
+              case zonas = "Gestión de zonas"
+              case generar = "Generar programación"
+              case ronda = "Ronda general"
+              case historial = "Historial y estadísticas"
+              case exportar = "Exportar e imprimir"
+              case config = "Configuración"
+
+              var id: String { rawValue }
+
+              var icono: String {
+                  switch self {
+                  case .inicio: return "house"
+                  case .docentes: return "person.3"
+                  case .zonas: return "map"
+                  case .generar: return "calendar.badge.plus"
+                  case .ronda: return "figure.walk"
+                  case .historial: return "chart.bar"
+                  case .exportar: return "square.and.arrow.up"
+                  case .config: return "gearshape"
+                  }
+              }
+
+              var esAdmin: Bool {
+                  return self == .docentes || self == .zonas || self == .generar || self == .config
+              }
+          }
+
+          extension View {
+              func avisoTexto(_ m: Binding<String?>) -> some View {
+                  self.alert("Aviso", isPresented: Binding(
+                      get: { m.wrappedValue != nil },
+                      set: { if !$0 { m.wrappedValue = nil } }
+                  )) {
+                      Button("Aceptar", role: .cancel) {}
+                  } message: {
+                      Text(m.wrappedValue ?? "")
+                  }
+              }
+          }
+
+          struct Pagina<Content: View>: View {
+              let titulo: String
+              let contenido: Content
+
+              init(_ titulo: String, @ViewBuilder _ contenido: () -> Content) {
+                  self.titulo = titulo
+                  self.contenido = contenido()
+              }
+
+              var body: some View {
+                  VStack(alignment: .leading, spacing: 12) {
+                      Text(titulo).font(.largeTitle).bold()
+                      contenido
+                  }
+                  .padding(20)
+                  .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+              }
+          }
+
+          struct Tarjeta<Content: View>: View {
+              let titulo: String
+              let contenido: Content
+
+              init(_ titulo: String, @ViewBuilder _ contenido: () -> Content) {
+                  self.titulo = titulo
+                  self.contenido = contenido()
+              }
+
+              var body: some View {
+                  VStack(alignment: .leading, spacing: 8) {
+                      Text(titulo).font(.headline)
+                      contenido
+                  }
+                  .padding(14)
+                  .frame(maxWidth: .infinity, alignment: .leading)
+                  .background(Color.gray.opacity(0.12))
+                  .cornerRadius(12)
+              }
+          }
+
+          struct ListaHallazgos: View {
+              let items: [Hallazgo]
+
+              var body: some View {
+                  VStack(alignment: .leading, spacing: 5) {
+                      ForEach(items) { h in
+                          HStack(alignment: .top, spacing: 6) {
+                              Image(systemName: icono(h.nivel)).foregroundColor(color(h.nivel))
+                              Text(h.texto).fixedSize(horizontal: false, vertical: true)
+                          }
+                      }
+                  }
+              }
+
+              private func icono(_ n: Nivel) -> String {
+                  switch n {
+                  case .ok: return "checkmark.circle.fill"
+                  case .aviso: return "exclamationmark.triangle.fill"
+                  case .error: return "xmark.octagon.fill"
+                  }
+              }
+
+              private func color(_ n: Nivel) -> Color {
+                  switch n {
+                  case .ok: return .green
+                  case .aviso: return .orange
+                  case .error: return .red
+                  }
+              }
+          }
+
+          struct ContentView: View {
+              @EnvironmentObject var store: Store
+              @State private var seleccion: Seccion = .inicio
+
+              var body: some View {
+                  HStack(spacing: 0) {
+                      VStack(alignment: .leading, spacing: 4) {
+                          Text("Acompañamiento docente").font(.headline)
+                          Text("IETIPAM · Sede Jorge Eliécer Gaitán")
+                              .font(.caption)
+                              .foregroundColor(.secondary)
+                              .padding(.bottom, 10)
+                          ForEach(Seccion.allCases) { s in
+                              Button {
+                                  seleccion = s
+                              } label: {
+                                  Label(s.rawValue, systemImage: s.icono)
+                                      .frame(maxWidth: .infinity, alignment: .leading)
+                                      .padding(.vertical, 7)
+                                      .padding(.horizontal, 10)
+                                      .background(seleccion == s ? Color.accentColor.opacity(0.25) : Color.clear)
+                                      .cornerRadius(8)
+                                      .contentShape(Rectangle())
+                              }
+                              .buttonStyle(.plain)
+                          }
+                          Spacer()
+                          if !store.data.settings.pin.isEmpty && store.unlocked {
+                              Button("Bloquear administración") { store.unlocked = false }
+                          }
+                      }
+                      .padding(12)
+                      .frame(width: 250)
+                      .background(Color.gray.opacity(0.10))
+                      Divider()
+                      detalle
+                          .frame(maxWidth: .infinity, maxHeight: .infinity)
+                  }
+              }
+
+              @ViewBuilder
+              private var detalle: some View {
+                  if seleccion.esAdmin && !store.data.settings.pin.isEmpty && !store.unlocked {
+                      PantallaBloqueo()
+                  } else {
+                      switch seleccion {
+                      case .inicio: InicioView(irGenerar: { seleccion = .generar })
+                      case .docentes: DocentesView()
+                      case .zonas: ZonasView()
+                      case .generar: GenerarView()
+                      case .ronda: RondaView()
+                      case .historial: HistorialView()
+                      case .exportar: ExportarView()
+                      case .config: ConfigView()
+                      }
+                  }
+              }
+          }
+
+          struct PantallaBloqueo: View {
+              @EnvironmentObject var store: Store
+              @State private var intento = ""
+              @State private var fallo = false
+
+              var body: some View {
+                  VStack(spacing: 12) {
+                      Image(systemName: "lock.fill").font(.system(size: 40))
+                      Text("Módulo de administración protegido").font(.title2)
+                      SecureField("PIN de administración", text: $intento)
+                          .frame(width: 220)
+                          .onSubmit { entrar() }
+                      Button("Entrar") { entrar() }
+                          .buttonStyle(.borderedProminent)
+                      if fallo { Text("PIN incorrecto").foregroundColor(.red) }
+                  }
+                  .frame(maxWidth: .infinity, maxHeight: .infinity)
+              }
+
+              private func entrar() {
+                  if intento == store.data.settings.pin {
+                      store.unlocked = true
+                      fallo = false
+                  } else {
+                      fallo = true
+                  }
+                  intento = ""
+              }
+          }
+
+          // MARK: - Panel de inicio
+
+          struct InicioView: View {
+              @EnvironmentObject var store: Store
+              var irGenerar: () -> Void
+
+              private var ultima: Schedule? {
+                  return store.data.schedules.sorted { $0.weekStart > $1.weekStart }.first
+              }
+
+              private var siguiente: Date {
+                  let pub = store.data.schedules.filter { $0.published }.map { $0.weekStart }
+                  if let m = pub.max() { return addDays(m, 7) }
+                  return mondayOf(Date())
+              }
+
+              private var alertas: [String] {
+                  var a: [String] = []
+                  if store.data.teachers.isEmpty { a.append("Aún no hay docentes registrados. Ve a «Gestión de docentes».") }
+                  if store.data.zones.filter({ $0.active }).isEmpty { a.append("No hay zonas activas.") }
+                  if !store.data.teachers.isEmpty {
+                      for d in 0..<5 {
+                          let n = store.data.teachers.filter { $0.active && $0.day == d }.count
+                          if n == 0 { a.append("No hay docentes con día fijo el \(diasNombre[d].lowercased()).") }
+                      }
+                  }
+                  if let u = ultima {
+                      let n = validar(u, store.data).filter { $0.nivel != .ok }.count
+                      if n > 0 { a.append("La última programación tiene \(n) alertas por revisar.") }
+                  }
+                  return a
+              }
+
+              var body: some View {
+                  Pagina("Panel de inicio") {
+                      ScrollView {
+                          VStack(alignment: .leading, spacing: 14) {
+                              Tarjeta("Semana actual") {
+                                  Text("Del lunes \(fechaLarga(mondayOf(Date()))) al viernes \(fechaLarga(addDays(mondayOf(Date()), 4)))")
+                              }
+                              Tarjeta("Última programación generada") {
+                                  if let u = ultima {
+                                      Text(etiquetaSemana(u))
+                                      Text(u.published ? "Estado: publicada" : "Estado: borrador sin publicar")
+                                          .foregroundColor(u.published ? .green : .orange)
+                                  } else {
+                                      Text("Todavía no se ha generado ninguna programación.")
+                                  }
+                              }
+                              Tarjeta("Docentes por día de acompañamiento") {
+                                  HStack(spacing: 10) {
+                                      ForEach(0..<5, id: \.self) { d in
+                                          VStack {
+                                              Text(diasNombre[d]).font(.caption)
+                                              Text("\(store.data.teachers.filter { $0.active && $0.day == d }.count)").font(.title2).bold()
+                                          }
+                                          .frame(maxWidth: .infinity)
+                                          .padding(8)
+                                          .background(Color.gray.opacity(0.12))
+                                          .cornerRadius(8)
+                                      }
+                                  }
+                              }
+                              Tarjeta("Alertas") {
+                                  if alertas.isEmpty {
+                                      Label("Sin alertas", systemImage: "checkmark.circle.fill").foregroundColor(.green)
+                                  } else {
+                                      ForEach(alertas, id: \.self) { t in
+                                          Label(t, systemImage: "exclamationmark.triangle.fill").foregroundColor(.orange)
+                                      }
+                                  }
+                              }
+                              Button {
+                                  store.requestedWeek = siguiente
+                                  irGenerar()
+                              } label: {
+                                  Label("Crear la siguiente semana (\(fechaDia(siguiente)))", systemImage: "plus.circle.fill")
+                                      .font(.title3)
+                                      .padding(.horizontal, 10)
+                                      .padding(.vertical, 4)
+                              }
+                              .buttonStyle(.borderedProminent)
+                              .controlSize(.large)
+                          }
+                      }
+                  }
+              }
+          }
+
+          // MARK: - Gestión de docentes
+
+          func diaIndice(_ texto: String) -> Int? {
+              let t = texto.lowercased()
+                  .folding(options: .diacriticInsensitive, locale: nil)
+                  .trimmingCharacters(in: .whitespaces)
+              switch t {
+              case "lunes", "1": return 0
+              case "martes", "2": return 1
+              case "miercoles", "3": return 2
+              case "jueves", "4": return 3
+              case "viernes", "5": return 4
+              default: return nil
+              }
+          }
+
+          @MainActor
+          struct DocentesView: View {
+              @EnvironmentObject var store: Store
+              @State private var detalle: IdRef?
+              @State private var ausencias: IdRef?
+              @State private var porBorrar: IdRef?
+              @State private var mensaje: String?
+
+              var body: some View {
+                  Pagina("Gestión de docentes") {
+                      HStack {
+                          Button("Agregar docente") {
+                              store.data.teachers.append(Teacher(name: "Nuevo docente", day: 0))
+                          }
+                          Button("Importar Excel/CSV…") { importar() }
+                          Button("Exportar CSV…") { exportar() }
+                          Spacer()
+                          Text("\(store.data.teachers.count) docentes registrados").foregroundColor(.secondary)
+                      }
+                      Text("El día fijo no cambia solo: solo se modifica aquí, de forma manual. Para importar, usa un archivo con columnas «Nombre» y «Día» (lunes a viernes).")
+                          .font(.caption)
+                          .foregroundColor(.secondary)
+                      List {
+                          ForEach($store.data.teachers) { $t in
+                              HStack {
+                                  TextField("Nombre completo", text: $t.name)
+                                      .frame(minWidth: 230)
+                                  Picker("", selection: $t.day) {
+                                      ForEach(0..<5, id: \.self) { i in
+                                          Text(diasNombre[i]).tag(i)
+                                      }
+                                  }
+                                  .labelsHidden()
+                                  .frame(width: 130)
+                                  Toggle("Activo", isOn: $t.active)
+                                  Button("Ausencias (\(t.absences.count))") { ausencias = IdRef(id: t.id) }
+                                  Button("Detalle") { detalle = IdRef(id: t.id) }
+                                  Button {
+                                      porBorrar = IdRef(id: t.id)
+                                  } label: {
+                                      Image(systemName: "trash")
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  .sheet(item: $detalle) { r in
+                      DetalleDocente(id: r.id).environmentObject(store)
+                  }
+                  .sheet(item: $ausencias) { r in
+                      AusenciasSheet(id: r.id).environmentObject(store)
+                  }
+                  .alert("¿Eliminar este docente?", isPresented: Binding(
+                      get: { porBorrar != nil },
+                      set: { if !$0 { porBorrar = nil } }
+                  )) {
+                      Button("Eliminar", role: .destructive) {
+                          if let r = porBorrar {
+                              store.data.teachers.removeAll { $0.id == r.id }
+                          }
+                          porBorrar = nil
+                      }
+                      Button("Cancelar", role: .cancel) { porBorrar = nil }
+                  } message: {
+                      Text("Sus asignaciones históricas se conservan, pero ya no aparecerá en nuevas semanas. Si solo se ausenta, mejor desactívalo.")
+                  }
+                  .avisoTexto($mensaje)
+              }
+
+              private func importar() {
+                  pedirAbrir { u in
+                      var texto: String? = try? String(contentsOf: u, encoding: .utf8)
+                      if texto == nil { texto = try? String(contentsOf: u, encoding: .isoLatin1) }
+                      guard let contenido = texto else {
+                          mensaje = "No se pudo leer el archivo."
+                          return
+                      }
+                      var nuevos = 0
+                      var sinDia = 0
+                      var primera = true
+                      for crudo in contenido.components(separatedBy: .newlines) {
+                          let linea = crudo.trimmingCharacters(in: .whitespaces)
+                          if linea.isEmpty { continue }
+                          let sep: Character = linea.contains(";") ? ";" : (linea.contains("\t") ? "\t" : ",")
+                          let cols = linea.split(separator: sep, omittingEmptySubsequences: false).map {
+                              String($0).trimmingCharacters(in: CharacterSet(charactersIn: " \""))
+                          }
+                          let nombre = cols.first ?? ""
+                          if nombre.isEmpty { continue }
+                          let dia: Int? = cols.count > 1 ? diaIndice(cols[1]) : nil
+                          if primera {
+                              primera = false
+                              let bajo = nombre.lowercased()
+                              if (bajo.contains("nombre") || bajo.contains("docente")) && dia == nil { continue }
+                          }
+                          if store.data.teachers.contains(where: { $0.name.lowercased() == nombre.lowercased() }) { continue }
+                          if dia == nil { sinDia += 1 }
+                          store.data.teachers.append(Teacher(name: nombre, day: dia ?? 0))
+                          nuevos += 1
+                      }
+                      mensaje = "Se importaron \(nuevos) docentes." + (sinDia > 0 ? " \(sinDia) no traían día válido y quedaron en lunes: revísalos." : "")
+                  }
+              }
+
+              private func exportar() {
+                  pedirGuardar(nombre: "docentes.csv") { u in
+                      var lineas = [csvLinea(["Nombre", "Día", "Activo"])]
+                      for t in store.data.teachers {
+                          lineas.append(csvLinea([t.name, diasNombre[t.day], t.active ? "Sí" : "No"]))
+                      }
+                      let texto = "\u{FEFF}" + lineas.joined(separator: "\r\n")
+                      do {
+                          try texto.write(to: u, atomically: true, encoding: .utf8)
+                          mensaje = "Listado exportado."
+                      } catch {
+                          mensaje = "No se pudo guardar el archivo."
+                      }
+                  }
+              }
+          }
+
+          struct AusenciasSheet: View {
+              @EnvironmentObject var store: Store
+              @Environment(\.dismiss) var dismiss
+              let id: UUID
+
+              var body: some View {
+                  VStack(alignment: .leading, spacing: 12) {
+                      if let i = store.data.teachers.firstIndex(where: { $0.id == id }) {
+                          Text("Ausencias y novedades de \(store.data.teachers[i].name)").font(.headline)
+                          Text("Incapacidades, permisos u otras novedades. Ese día el docente no se asigna a zona ni a ronda general.")
+                              .font(.caption)
+                              .foregroundColor(.secondary)
+                          List {
+                              ForEach($store.data.teachers[i].absences) { $a in
+                                  HStack {
+                                      DatePicker("Desde", selection: $a.start, displayedComponents: .date)
+                                      DatePicker("Hasta", selection: $a.end, displayedComponents: .date)
+                                      TextField("Motivo", text: $a.note)
+                                      Button {
+                                          store.data.teachers[i].absences.removeAll { $0.id == a.id }
+                                      } label: {
+                                          Image(systemName: "trash")
+                                      }
+                                  }
+                              }
+                          }
+                          Button("Agregar ausencia") {
+                              store.data.teachers[i].absences.append(Absence(start: Date(), end: Date()))
+                          }
+                      }
+                      HStack {
+                          Spacer()
+                          Button("Cerrar") { dismiss() }
+                      }
+                  }
+                  .padding(20)
+                  .frame(width: 820, height: 420)
+              }
+          }
+
+          struct DetalleDocente: View {
+              @EnvironmentObject var store: Store
+              @Environment(\.dismiss) var dismiss
+              let id: UUID
+
+              var body: some View {
+                  let publicadas = store.data.schedules.filter { $0.published }.sorted { $0.weekStart < $1.weekStart }
+                  let hist = buildHistory(store.data.schedules, before: nil)
+                  VStack(alignment: .leading, spacing: 10) {
+                      Text(store.nombreDocente(id)).font(.title2).bold()
+                      Text("Semanas publicadas: \(publicadas.count)").foregroundColor(.secondary)
+                      Text("Zonas acompañadas").font(.headline)
+                      ForEach(store.data.zones) { z in
+                          let n = hist.zoneVisits[id]?[z.id] ?? 0
+                          Text("• \(z.name): \(n) \(n == 1 ? "vez" : "veces")")
+                      }
+                      Text("Ronda general").font(.headline)
+                      let semanas = publicadas.filter { s in
+                          (0..<5).contains(where: { d in s.ronda(d).a == id || s.ronda(d).b == id })
+                      }
+                      Text("Participó en \(semanas.count) semanas (frecuencia: \(publicadas.isEmpty ? 0 : Int(Double(semanas.count) * 100 / Double(publicadas.count)))%).")
+                      if !semanas.isEmpty {
+                          Text(semanas.map { fechaCorta($0.weekStart) }.joined(separator: ", ")).font(.caption)
+                      }
+                      Spacer()
+                      HStack {
+                          Spacer()
+                          Button("Cerrar") { dismiss() }
+                      }
+                  }
+                  .padding(20)
+                  .frame(width: 560, height: 420)
+              }
+          }
+
+          // MARK: - Gestión de zonas
+
+          struct ZonasView: View {
+              @EnvironmentObject var store: Store
+              @State private var porBorrar: IdRef?
+
+              var body: some View {
+                  Pagina("Gestión de zonas") {
+                      HStack {
+                          Button("Agregar zona") {
+                              store.data.zones.append(Zone(name: "Nueva zona"))
+                          }
+                          Spacer()
+                          Text("\(store.data.zones.filter { $0.active }.count) zonas activas").foregroundColor(.secondary)
+                      }
+                      Text("Desactiva una zona para dejarla fuera de las nuevas semanas sin perder el historial.")
+                          .font(.caption)
+                          .foregroundColor(.secondary)
+                      List {
+                          ForEach($store.data.zones) { $z in
+                              HStack {
+                                  TextField("Nombre de la zona", text: $z.name)
+                                  Toggle("Activa", isOn: $z.active)
+                                  Button {
+                                      porBorrar = IdRef(id: z.id)
+                                  } label: {
+                                      Image(systemName: "trash")
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  .alert("¿Eliminar esta zona?", isPresented: Binding(
+                      get: { porBorrar != nil },
+                      set: { if !$0 { porBorrar = nil } }
+                  )) {
+                      Button("Eliminar", role: .destructive) {
+                          if let r = porBorrar {
+                              store.data.zones.removeAll { $0.id == r.id }
+                          }
+                          porBorrar = nil
+                      }
+                      Button("Cancelar", role: .cancel) { porBorrar = nil }
+                  } message: {
+                      Text("Las programaciones antiguas que la usaban mostrarán «Sin zona». Si prefieres conservar el historial, desactívala.")
+                  }
+              }
+          }
+
+          // MARK: - Tabla de programación (editable o de solo lectura)
+
+          struct ProgramacionTabla: View {
+              @EnvironmentObject var store: Store
+              @Binding var s: Schedule
+              let editable: Bool
+
+              var body: some View {
+                  VStack(alignment: .leading, spacing: 12) {
+                      ForEach(0..<5, id: \.self) { d in
+                          VStack(alignment: .leading, spacing: 6) {
+                              Text("\(diasNombre[d]) \(fechaDia(addDays(s.weekStart, d)))").font(.headline)
+                              ForEach($s.assignments) { $a in
+                                  if a.day == d {
+                                      HStack {
+                                          Text(store.nombreDocente(a.teacherId)).frame(width: 280, alignment: .leading)
+                                          if a.absent {
+                                              Text("Ausente (sin zona)").foregroundColor(.orange)
+                                          } else if editable {
+                                              Picker("", selection: $a.zoneId) {
+                                                  Text("Sin zona").tag(UUID?.none)
+                                                  ForEach(store.data.zones) { z in
+                                                      Text(z.name + (z.active ? "" : " (inactiva)")).tag(Optional(z.id))
+                                                  }
+                                              }
+                                              .labelsHidden()
+                                              .frame(width: 340)
+                                          } else {
+                                              Text(store.nombreZona(a.zoneId))
+                                          }
+                                          Spacer()
+                                      }
+                                  }
+                              }
+                              HStack {
+                                  Text("Ronda general").bold().frame(width: 280, alignment: .leading)
+                                  if editable {
+                                      Picker("", selection: $s.rondas[d].a) {
+                                          Text("—").tag(UUID?.none)
+                                          ForEach(store.data.teachers.filter { $0.active }) { t in
+                                              Text(t.name).tag(Optional(t.id))
+                                          }
+                                      }
+                                      .labelsHidden()
+                                      .frame(width: 250)
+                                      Picker("", selection: $s.rondas[d].b) {
+                                          Text("—").tag(UUID?.none)
+                                          ForEach(store.data.teachers.filter { $0.active }) { t in
+                                              Text(t.name).tag(Optional(t.id))
+                                          }
+                                      }
+                                      .labelsHidden()
+                                      .frame(width: 250)
+                                  } else {
+                                      Text(store.nombreDocente(s.ronda(d).a) + " y " + store.nombreDocente(s.ronda(d).b)).bold()
+                                  }
+                                  Spacer()
+                              }
+                          }
+                          .padding(12)
+                          .frame(maxWidth: .infinity, alignment: .leading)
+                          .background(Color.gray.opacity(0.12))
+                          .cornerRadius(10)
+                      }
+                      Text("Observaciones: " + store.data.settings.observation)
+                          .font(.caption)
+                          .foregroundColor(.secondary)
+                  }
+              }
+          }
+
+          // MARK: - Generar programación
+
+          struct GenerarView: View {
+              @EnvironmentObject var store: Store
+              @State private var semana = mondayOf(Date())
+              @State private var seleccionId: UUID?
+              @State private var confirmar = false
+              @State private var mensaje: String?
+
+              private var indice: Int? {
+                  guard let id = seleccionId else { return nil }
+                  return store.data.schedules.firstIndex(where: { $0.id == id })
+              }
+
+              private func existente(_ lunes: Date) -> Schedule? {
+                  return store.data.schedules.first(where: { calendarioCO.isDate($0.weekStart, inSameDayAs: lunes) })
+              }
+
+              var body: some View {
+                  Pagina("Generar programación semanal") {
+                      ScrollView {
+                          VStack(alignment: .leading, spacing: 14) {
+                              Tarjeta("Parámetros de la semana") {
+                                  HStack(spacing: 16) {
+                                      DatePicker("Lunes de la semana", selection: Binding(
+                                          get: { semana },
+                                          set: { nueva in
+                                              semana = mondayOf(nueva)
+                                              seleccionId = existente(semana)?.id
+                                          }
+                                      ), displayedComponents: .date)
+                                      .frame(width: 330)
+                                      TextField("Jornada", text: $store.data.settings.jornada)
+                                          .frame(width: 160)
+                                  }
+                                  Text(etiquetaSemanaTexto)
+                                      .foregroundColor(.secondary)
+                                  Text("\(store.data.teachers.filter { $0.active }.count) docentes habilitados · \(store.data.zones.filter { $0.active }.count) zonas activas · \(novedades) novedades esta semana")
+                                      .font(.caption)
+                                      .foregroundColor(.secondary)
+                                  Button {
+                                      generar()
+                                  } label: {
+                                      Label("Generar programación", systemImage: "wand.and.stars")
+                                          .font(.title3)
+                                          .padding(.horizontal, 8)
+                                          .padding(.vertical, 3)
+                                  }
+                                  .buttonStyle(.borderedProminent)
+                                  .controlSize(.large)
+                              }
+
+                              if let i = indice {
+                                  let s = store.data.schedules[i]
+                                  Tarjeta("Resumen de validación") {
+                                      ListaHallazgos(items: validar(s, store.data))
+                                  }
+                                  Text(s.published ? "Programación publicada (no se puede modificar)." : "Borrador: puedes cambiar zonas y rondas antes de publicar.")
+                                      .foregroundColor(s.published ? .green : .orange)
+                                  ProgramacionTabla(s: $store.data.schedules[i], editable: !s.published)
+                                  if !s.published {
+                                      HStack {
+                                          Button("Publicar programación") {
+                                              let problemas = validar(s, store.data).filter { $0.nivel != .ok }
+                                              if problemas.isEmpty { publicar(s.id) } else { confirmar = true }
+                                          }
+                                          .buttonStyle(.borderedProminent)
+                                          Button("Descartar borrador", role: .destructive) {
+                                              store.data.schedules.removeAll { $0.id == s.id }
+                                              seleccionId = nil
+                                          }
+                                          Spacer()
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  .onAppear {
+                      if let w = store.requestedWeek {
+                          semana = mondayOf(w)
+                          store.requestedWeek = nil
+                      }
+                      seleccionId = existente(semana)?.id
+                  }
+                  .alert("La programación tiene alertas", isPresented: $confirmar) {
+                      Button("Publicar de todos modos") {
+                          if let i = indice { publicar(store.data.schedules[i].id) }
+                      }
+                      Button("Revisar", role: .cancel) {}
+                  } message: {
+                      Text("Hay avisos o conflictos en el resumen de validación. Revísalos antes de publicar.")
+                  }
+                  .avisoTexto($mensaje)
+              }
+
+              private var etiquetaSemanaTexto: String {
+                  return "Semana del \(fechaLarga(semana)) al \(fechaLarga(addDays(semana, 4)))"
+              }
+
+              private var novedades: Int {
+                  var n = 0
+                  for t in store.data.teachers where t.active {
+                      for d in 0..<5 {
+                          if isAbsent(t, on: addDays(semana, d)) { n += 1 }
+                      }
+                  }
+                  return n
+              }
+
+              private func generar() {
+                  let lunes = mondayOf(semana)
+                  if let ex = existente(lunes) {
+                      if ex.published {
+                          mensaje = "Esa semana ya está publicada y no se modifica. Elige otro lunes."
+                          seleccionId = ex.id
+                          return
+                      }
+                      store.data.schedules.removeAll { $0.id == ex.id }
+                  }
+                  let nueva = generarSemana(store.data, weekStart: lunes, jornada: store.data.settings.jornada)
+                  store.data.schedules.append(nueva)
+                  seleccionId = nueva.id
+              }
+
+              private func publicar(_ id: UUID) {
+                  if let i = store.data.schedules.firstIndex(where: { $0.id == id }) {
+                      store.data.schedules[i].published = true
+                  }
+              }
+          }
+
+          // MARK: - Ronda general
+
+          struct RondaView: View {
+              @EnvironmentObject var store: Store
+
+              var body: some View {
+                  let publicadas = store.data.schedules.filter { $0.published }.sorted { $0.weekStart < $1.weekStart }
+                  let hist = buildHistory(store.data.schedules, before: nil)
+                  Pagina("Ronda general") {
+                      ScrollView {
+                          VStack(alignment: .leading, spacing: 14) {
+                              Tarjeta("Ronda general de la última semana") {
+                                  if let u = store.data.schedules.sorted(by: { $0.weekStart > $1.weekStart }).first {
+                                      Text(etiquetaSemana(u)).foregroundColor(.secondary)
+                                      ForEach(0..<5, id: \.self) { d in
+                                          Text("\(diasNombre[d]): \(store.nombreDocente(u.ronda(d).a)) y \(store.nombreDocente(u.ronda(d).b))")
+                                      }
+                                  } else {
+                                      Text("Aún no hay programaciones.")
+                                  }
+                              }
+                              Tarjeta("Participación individual") {
+                                  ForEach(store.data.teachers) { t in
+                                      Text("\(t.name): \(hist.rondaCount[t.id] ?? 0) participaciones en \(publicadas.count) semanas publicadas")
+                                  }
+                              }
+                              Tarjeta("Parejas que han hecho ronda") {
+                                  let parejas = hist.pairCount.sorted { $0.value > $1.value }
+                                  if parejas.isEmpty {
+                                      Text("Todavía no hay parejas en el historial.")
+                                  }
+                                  ForEach(parejas, id: \.key) { p in
+                                      let ids = p.key.split(separator: "|").compactMap { UUID(uuidString: String($0)) }
+                                      if ids.count == 2 {
+                                          Text("\(store.nombreDocente(ids[0])) y \(store.nombreDocente(ids[1])): \(p.value) \(p.value == 1 ? "vez" : "veces")")
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+
+          // MARK: - Historial y estadísticas
+
+          struct HistorialView: View {
+              @EnvironmentObject var store: Store
+              @State private var seleccionId: UUID?
+              @State private var comparaA: UUID?
+              @State private var comparaB: UUID?
+
+              var body: some View {
+                  let todas = store.data.schedules.sorted { $0.weekStart > $1.weekStart }
+                  let publicadas = todas.filter { $0.published }
+                  let hist = buildHistory(store.data.schedules, before: nil)
+                  let zonas = store.data.zones
+                  Pagina("Historial y estadísticas") {
+                      ScrollView {
+                          VStack(alignment: .leading, spacing: 14) {
+                              Tarjeta("Programaciones guardadas") {
+                                  if todas.isEmpty { Text("Aún no hay programaciones.") }
+                                  ForEach(todas) { s in
+                                      Button {
+                                          seleccionId = (seleccionId == s.id) ? nil : s.id
+                                      } label: {
+                                          HStack {
+                                              Text(etiquetaSemana(s))
+                                              Text(s.published ? "publicada" : "borrador").foregroundColor(s.published ? .green : .orange)
+                                              Spacer()
+                                              Image(systemName: seleccionId == s.id ? "chevron.up" : "chevron.down")
+                                          }
+                                          .contentShape(Rectangle())
+                                      }
+                                      .buttonStyle(.plain)
+                                  }
+                              }
+                              if let id = seleccionId, let i = store.data.schedules.firstIndex(where: { $0.id == id }) {
+                                  ProgramacionTabla(s: $store.data.schedules[i], editable: false)
+                              }
+
+                              Tarjeta("Estadísticas por docente (semanas publicadas: \(publicadas.count))") {
+                                  HStack {
+                                      Text("Docente").bold().frame(width: 220, alignment: .leading)
+                                      Text("Día").bold().frame(width: 90, alignment: .leading)
+                                      ForEach(Array(zonas.enumerated()), id: \.element.id) { idx, _ in
+                                          Text("Z\(idx + 1)").bold().frame(width: 40)
+                                      }
+                                      Text("Rondas").bold().frame(width: 60)
+                                  }
+                                  ForEach(store.data.teachers) { t in
+                                      HStack {
+                                          Text(t.name).frame(width: 220, alignment: .leading)
+                                          Text(diasNombre[t.day]).frame(width: 90, alignment: .leading)
+                                          ForEach(zonas) { z in
+                                              Text("\(hist.zoneVisits[t.id]?[z.id] ?? 0)").frame(width: 40)
+                                          }
+                                          Text("\(hist.rondaCount[t.id] ?? 0)").frame(width: 60)
+                                      }
+                                  }
+                                  Text(zonas.enumerated().map { "Z\($0.offset + 1) = \($0.element.name)" }.joined(separator: " · "))
+                                      .font(.caption)
+                                      .foregroundColor(.secondary)
+                              }
+
+                              Tarjeta("Desequilibrios y repeticiones") {
+                                  ListaHallazgos(items: desequilibrios(hist))
+                              }
+
+                              Tarjeta("Comparar dos semanas") {
+                                  HStack {
+                                      Picker("Semana A", selection: $comparaA) {
+                                          Text("—").tag(UUID?.none)
+                                          ForEach(todas) { s in Text(fechaCorta(s.weekStart)).tag(Optional(s.id)) }
+                                      }
+                                      Picker("Semana B", selection: $comparaB) {
+                                          Text("—").tag(UUID?.none)
+                                          ForEach(todas) { s in Text(fechaCorta(s.weekStart)).tag(Optional(s.id)) }
+                                      }
+                                  }
+                                  if let a = todas.first(where: { $0.id == comparaA }), let b = todas.first(where: { $0.id == comparaB }) {
+                                      ForEach(store.data.teachers) { t in
+                                          let za = a.assignments.first(where: { $0.teacherId == t.id })
+                                          let zb = b.assignments.first(where: { $0.teacherId == t.id })
+                                          HStack {
+                                              Text(t.name).frame(width: 220, alignment: .leading)
+                                              Text(za == nil ? "—" : store.nombreZona(za?.zoneId)).frame(width: 260, alignment: .leading)
+                                              Text(zb == nil ? "—" : store.nombreZona(zb?.zoneId)).frame(width: 260, alignment: .leading)
+                                              if let x = za, let y = zb, x.zoneId == y.zoneId {
+                                                  Text("repite").foregroundColor(.orange)
+                                              }
+                                          }
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+
+              private func desequilibrios(_ hist: HistoryStats) -> [Hallazgo] {
+                  var out: [Hallazgo] = []
+                  let activos = store.data.teachers.filter { $0.active }
+                  if activos.count > 1 {
+                      let vals = activos.map { hist.rondaCount[$0.id] ?? 0 }
+                      if let mx = vals.max(), let mn = vals.min(), mx - mn > 1 {
+                          out.append(Hallazgo(nivel: .aviso, texto: "La ronda general está desigual: entre \(mn) y \(mx) participaciones por docente."))
+                      }
+                  }
+                  for t in activos {
+                      let vis = store.data.zones.filter { $0.active }.map { hist.zoneVisits[t.id]?[$0.id] ?? 0 }
+                      if let mx = vis.max(), let mn = vis.min(), mx - mn > 1 {
+                          out.append(Hallazgo(nivel: .aviso, texto: "\(t.name) tiene zonas muy desiguales (entre \(mn) y \(mx) veces)."))
+                      }
+                  }
+                  let repetidas = hist.pairCount.filter { $0.value > 2 }.count
+                  if repetidas > 0 {
+                      out.append(Hallazgo(nivel: .aviso, texto: "\(repetidas) parejas de ronda se han repetido más de dos veces."))
+                  }
+                  if out.isEmpty { out.append(Hallazgo(nivel: .ok, texto: "No se detectan desequilibrios ni repeticiones relevantes.")) }
+                  return out
+              }
+          }
+
+          // MARK: - Exportar e imprimir
+
+          @MainActor
+          struct ExportarView: View {
+              @EnvironmentObject var store: Store
+              @State private var seleccionId: UUID?
+              @State private var mensaje: String?
+
+              private var actual: Schedule? {
+                  let todas = store.data.schedules.sorted { $0.weekStart > $1.weekStart }
+                  if let id = seleccionId, let s = todas.first(where: { $0.id == id }) { return s }
+                  return todas.first
+              }
+
+              var body: some View {
+                  let todas = store.data.schedules.sorted { $0.weekStart > $1.weekStart }
+                  Pagina("Exportar e imprimir") {
+                      if todas.isEmpty {
+                          Text("Primero genera una programación en «Generar programación».")
+                      } else {
+                          HStack {
+                              Picker("Semana", selection: Binding(
+                                  get: { actual?.id },
+                                  set: { seleccionId = $0 }
+                              )) {
+                                  ForEach(todas) { s in
+                                      Text(etiquetaSemana(s) + (s.published ? "" : " (borrador)")).tag(Optional(s.id))
+                                  }
+                              }
+                              .frame(width: 520)
+                              Spacer()
+                          }
+                          HStack {
+                              Button("Descargar PDF") { guardarPDF() }
+                              Button("Descargar Excel (.xlsx)") { guardarExcel() }
+                              Button("Descargar CSV") { guardarCSV() }
+                              Button("Imprimir") { if let s = actual { imprimirSemana(s, store.data) } }
+                              Button("Copiar tabla") {
+                                  if let s = actual {
+                                      copiarTabla(s, store.data)
+                                      mensaje = "Tabla copiada. Pégala en WhatsApp, correo o Word."
+                                  }
+                              }
+                              Spacer()
+                          }
+                          ScrollView {
+                              if let s = actual {
+                                  VistaImprimible(s: s, data: store.data)
+                                      .cornerRadius(6)
+                                      .shadow(radius: 2)
+                              }
+                          }
+                      }
+                  }
+                  .avisoTexto($mensaje)
+              }
+
+              private func guardarPDF() {
+                  guard let s = actual else { return }
+                  pedirGuardar(nombre: nombreArchivoBase(s) + ".pdf") { u in
+                      mensaje = exportarPDF(VistaImprimible(s: s, data: store.data), a: u) ? "PDF guardado." : "No se pudo crear el PDF."
+                  }
+              }
+
+              private func guardarExcel() {
+                  guard let s = actual else { return }
+                  pedirGuardar(nombre: nombreArchivoBase(s) + ".xlsx") { u in
+                      do {
+                          try escribirXLSX(filas: tablaCompleta(s, store.data), hoja: "Acompañamiento", destino: u)
+                          mensaje = "Excel guardado."
+                      } catch {
+                          mensaje = "No se pudo crear el Excel. Prueba con CSV."
+                      }
+                  }
+              }
+
+              private func guardarCSV() {
+                  guard let s = actual else { return }
+                  pedirGuardar(nombre: nombreArchivoBase(s) + ".csv") { u in
+                      do {
+                          try csvTexto(s, store.data).write(to: u, atomically: true, encoding: .utf8)
+                          mensaje = "CSV guardado."
+                      } catch {
+                          mensaje = "No se pudo guardar el CSV."
+                      }
+                  }
+              }
+          }
+
+          // MARK: - Configuración
+
+          @MainActor
+          struct ConfigView: View {
+              @EnvironmentObject var store: Store
+              @State private var mensaje: String?
+              @State private var reporte: String?
+              @State private var confirmarBorrado = false
+
+              var body: some View {
+                  Pagina("Configuración") {
+                      ScrollView {
+                          VStack(alignment: .leading, spacing: 14) {
+                              Tarjeta("Información institucional") {
+                                  TextField("Institución", text: $store.data.settings.institution)
+                                  TextField("Sede", text: $store.data.settings.sede)
+                                  TextField("Jornada", text: $store.data.settings.jornada)
+                                  Text("Observación institucional").font(.caption).foregroundColor(.secondary)
+                                  TextEditor(text: $store.data.settings.observation)
+                                      .frame(height: 70)
+                              }
+                              Tarjeta("Protección de administración") {
+                                  SecureField("PIN (déjalo vacío para no usar PIN)", text: $store.data.settings.pin)
+                                      .frame(width: 320)
+                                  Text("Con PIN, las secciones de docentes, zonas, generación y configuración piden clave al abrir la app.")
+                                      .font(.caption)
+                                      .foregroundColor(.secondary)
+                              }
+                              Tarjeta("Copia de seguridad") {
+                                  HStack {
+                                      Button("Guardar copia…") {
+                                          pedirGuardar(nombre: "copia-acompanamiento.json") { u in
+                                              do {
+                                                  try store.exportarCopia(a: u)
+                                                  mensaje = "Copia guardada."
+                                              } catch {
+                                                  mensaje = "No se pudo guardar la copia."
+                                              }
+                                          }
+                                      }
+                                      Button("Restaurar copia…") {
+                                          pedirAbrir { u in
+                                              do {
+                                                  try store.restaurarCopia(de: u)
+                                                  mensaje = "Copia restaurada."
+                                              } catch {
+                                                  mensaje = "El archivo no es una copia válida."
+                                              }
+                                          }
+                                      }
+                                      Button("Borrar todas las programaciones", role: .destructive) { confirmarBorrado = true }
+                                  }
+                                  Text("Los datos se guardan automáticamente en este Mac, en la carpeta Application Support/Acompanamiento.")
+                                      .font(.caption)
+                                      .foregroundColor(.secondary)
+                              }
+                              Tarjeta("Pruebas del algoritmo") {
+                                  Text("Simula 8 semanas consecutivas y verifica días fijos, rotación, ronda general, parejas y exportaciones.")
+                                  Button("Ejecutar pruebas de 8 semanas") {
+                                      reporte = ejecutarPruebas(store.data)
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  .sheet(isPresented: Binding(get: { reporte != nil }, set: { if !$0 { reporte = nil } })) {
+                      VStack(alignment: .leading, spacing: 10) {
+                          ScrollView {
+                              Text(reporte ?? "")
+                                  .font(.system(.body, design: .monospaced))
+                                  .frame(maxWidth: .infinity, alignment: .leading)
+                                  .textSelection(.enabled)
+                          }
+                          HStack {
+                              Spacer()
+                              Button("Cerrar") { reporte = nil }
+                          }
+                      }
+                      .padding(20)
+                      .frame(width: 760, height: 560)
+                  }
+                  .alert("¿Borrar todas las programaciones?", isPresented: $confirmarBorrado) {
+                      Button("Borrar", role: .destructive) { store.data.schedules = [] }
+                      Button("Cancelar", role: .cancel) {}
+                  } message: {
+                      Text("Se pierde el historial de rotación. Los docentes y zonas se conservan.")
+                  }
+                  .avisoTexto($mensaje)
+              }
+          }
+          EOF_FILE
+
+      - name: Compilar y empaquetar la app
+        working-directory: proj
+        run: |
+          set -e
+          if swift build -c release --arch arm64 --arch x86_64; then
+            BIN=$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)
+          else
+            swift build -c release
+            BIN=$(swift build -c release --show-bin-path)
+          fi
+          APP="Acompanamiento.app"
+          rm -rf "$APP"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp "$BIN/Acompanamiento" "$APP/Contents/MacOS/Acompanamiento"
+          cat > "$APP/Contents/Info.plist" <<'EOF_PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleExecutable</key><string>Acompanamiento</string>
+              <key>CFBundleIdentifier</key><string>co.ietipam.acompanamiento</string>
+              <key>CFBundleName</key><string>Acompañamiento</string>
+              <key>CFBundleDisplayName</key><string>Acompañamiento Docente</string>
+              <key>CFBundlePackageType</key><string>APPL</string>
+              <key>CFBundleShortVersionString</key><string>1.0</string>
+              <key>CFBundleVersion</key><string>1</string>
+              <key>LSMinimumSystemVersion</key><string>13.0</string>
+              <key>NSHighResolutionCapable</key><true/>
+              <key>NSPrincipalClass</key><string>NSApplication</string>
+          </dict>
+          </plist>
+          EOF_PLIST
+          codesign --force --deep --sign - "$APP"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" Acompanamiento.zip
+          ls -la Acompanamiento.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Acompanamiento-Mac
+          path: proj/Acompanamiento.zip
