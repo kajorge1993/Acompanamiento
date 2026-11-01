@@ -48,6 +48,7 @@ jobs:
           import AppKit
 
           let diasNombre = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes"]
+          let modosNombre = ["Zona y ronda general", "Solo ronda general", "Solo zona"]
 
           let zonasIniciales = [
               "Bloque Coordinación y Baños Mujeres",
@@ -107,6 +108,10 @@ jobs:
               var day: Int
               var active: Bool = true
               var absences: [Absence] = []
+              // 0 = zona y ronda general, 1 = solo ronda general, 2 = solo zona
+              var mode: Int? = nil
+
+              var modo: Int { return mode ?? 0 }
           }
 
           struct Zone: Codable, Identifiable, Hashable {
@@ -128,18 +133,70 @@ jobs:
               var b: UUID? = nil
           }
 
-          struct Schedule: Codable, Identifiable, Hashable {
+          // Día sin acompañamiento (festivo, sin clases...). scope: 0 = todo el día, 1 = solo sin ronda general
+          struct FreeDay: Codable, Identifiable, Hashable {
               var id = UUID()
+              var date: Date
+              var reason: String
+              var scope: Int
+          }
+
+          struct Schedule: Codable, Identifiable, Hashable {
+              var id: UUID
               var weekStart: Date
               var jornada: String
               var assignments: [Assignment]
               var rondas: [Ronda]
-              var published: Bool = false
-              var notes: String = ""
-              var warnings: [String] = []
+              var published: Bool
+              var notes: String
+              var warnings: [String]
+              // Por día: 0 = normal, 1 = sin acompañamiento, 2 = sin ronda general
+              var dayStatus: [Int]
+              var dayNote: [String]
+
+              init(id: UUID = UUID(), weekStart: Date, jornada: String, assignments: [Assignment], rondas: [Ronda],
+                   published: Bool = false, notes: String = "", warnings: [String] = [],
+                   dayStatus: [Int] = [0, 0, 0, 0, 0], dayNote: [String] = ["", "", "", "", ""]) {
+                  self.id = id
+                  self.weekStart = weekStart
+                  self.jornada = jornada
+                  self.assignments = assignments
+                  self.rondas = rondas
+                  self.published = published
+                  self.notes = notes
+                  self.warnings = warnings
+                  self.dayStatus = dayStatus
+                  self.dayNote = dayNote
+              }
+
+              enum CodingKeys: String, CodingKey {
+                  case id, weekStart, jornada, assignments, rondas, published, notes, warnings, dayStatus, dayNote
+              }
+
+              init(from decoder: Decoder) throws {
+                  let c = try decoder.container(keyedBy: CodingKeys.self)
+                  id = try c.decode(UUID.self, forKey: .id)
+                  weekStart = try c.decode(Date.self, forKey: .weekStart)
+                  jornada = try c.decodeIfPresent(String.self, forKey: .jornada) ?? ""
+                  assignments = try c.decodeIfPresent([Assignment].self, forKey: .assignments) ?? []
+                  rondas = try c.decodeIfPresent([Ronda].self, forKey: .rondas) ?? []
+                  published = try c.decodeIfPresent(Bool.self, forKey: .published) ?? false
+                  notes = try c.decodeIfPresent(String.self, forKey: .notes) ?? ""
+                  warnings = try c.decodeIfPresent([String].self, forKey: .warnings) ?? []
+                  dayStatus = try c.decodeIfPresent([Int].self, forKey: .dayStatus) ?? [0, 0, 0, 0, 0]
+                  dayNote = try c.decodeIfPresent([String].self, forKey: .dayNote) ?? ["", "", "", "", ""]
+              }
 
               func ronda(_ d: Int) -> Ronda {
                   return d >= 0 && d < rondas.count ? rondas[d] : Ronda()
+              }
+
+              func estado(_ d: Int) -> Int {
+                  return d >= 0 && d < dayStatus.count ? dayStatus[d] : 0
+              }
+
+              func nota(_ d: Int) -> String {
+                  return d >= 0 && d < dayNote.count ? dayNote[d] : ""
               }
           }
 
@@ -156,6 +213,22 @@ jobs:
               var zones: [Zone] = zonasIniciales.map { Zone(name: $0) }
               var schedules: [Schedule] = []
               var settings = Settings()
+              var freeDays: [FreeDay] = []
+
+              init() {}
+
+              enum CodingKeys: String, CodingKey {
+                  case teachers, zones, schedules, settings, freeDays
+              }
+
+              init(from decoder: Decoder) throws {
+                  let c = try decoder.container(keyedBy: CodingKeys.self)
+                  teachers = try c.decodeIfPresent([Teacher].self, forKey: .teachers) ?? []
+                  zones = try c.decodeIfPresent([Zone].self, forKey: .zones) ?? zonasIniciales.map { Zone(name: $0) }
+                  schedules = try c.decodeIfPresent([Schedule].self, forKey: .schedules) ?? []
+                  settings = try c.decodeIfPresent(Settings.self, forKey: .settings) ?? Settings()
+                  freeDays = try c.decodeIfPresent([FreeDay].self, forKey: .freeDays) ?? []
+              }
           }
 
           func makeEncoder() -> JSONEncoder {
@@ -174,9 +247,9 @@ jobs:
           func normalizar(_ d: AppData) -> AppData {
               var x = d
               for i in x.schedules.indices {
-                  while x.schedules[i].rondas.count < 5 {
-                      x.schedules[i].rondas.append(Ronda())
-                  }
+                  while x.schedules[i].rondas.count < 5 { x.schedules[i].rondas.append(Ronda()) }
+                  while x.schedules[i].dayStatus.count < 5 { x.schedules[i].dayStatus.append(0) }
+                  while x.schedules[i].dayNote.count < 5 { x.schedules[i].dayNote.append("") }
               }
               return x
           }
@@ -187,7 +260,9 @@ jobs:
               }
               @Published var unlocked = false
               @Published var requestedWeek: Date? = nil
+              @Published var aviso: String? = nil
               private let url: URL
+              private let carpetaCopias: URL
 
               init() {
                   let fm = FileManager.default
@@ -197,11 +272,43 @@ jobs:
                   try? fm.createDirectory(at: carpeta, withIntermediateDirectories: true)
                   let archivo = carpeta.appendingPathComponent("datos.json")
                   url = archivo
-                  if let crudo = try? Data(contentsOf: archivo),
-                     let leido = try? makeDecoder().decode(AppData.self, from: crudo) {
-                      data = normalizar(leido)
-                  } else {
-                      data = AppData()
+                  carpetaCopias = carpeta.appendingPathComponent("Copias", isDirectory: true)
+
+                  var inicial = AppData()
+                  var mensaje: String? = nil
+                  var leido = false
+                  if fm.fileExists(atPath: archivo.path) {
+                      if let crudo = try? Data(contentsOf: archivo),
+                         let decodificado = try? makeDecoder().decode(AppData.self, from: crudo) {
+                          inicial = normalizar(decodificado)
+                          leido = true
+                      } else {
+                          let marca = formateador("yyyyMMdd-HHmmss").string(from: Date())
+                          let guardado = carpeta.appendingPathComponent("datos-ilegible-\(marca).json")
+                          try? fm.moveItem(at: archivo, to: guardado)
+                          mensaje = "No se pudieron leer los datos guardados. El archivo original se conservó como datos-ilegible-\(marca).json en la carpeta Acompanamiento y la app empezó vacía. Puedes restaurar una copia desde Configuración."
+                      }
+                  }
+                  data = inicial
+                  aviso = mensaje
+                  if leido { copiaAutomatica() }
+              }
+
+              private func copiaAutomatica() {
+                  let fm = FileManager.default
+                  try? fm.createDirectory(at: carpetaCopias, withIntermediateDirectories: true)
+                  let hoy = formateador("yyyy-MM-dd").string(from: Date())
+                  let destino = carpetaCopias.appendingPathComponent("datos-\(hoy).json")
+                  if !fm.fileExists(atPath: destino.path) {
+                      try? fm.copyItem(at: url, to: destino)
+                  }
+                  if let nombres = try? fm.contentsOfDirectory(atPath: carpetaCopias.path) {
+                      let copias = nombres.filter { $0.hasPrefix("datos-") && $0.hasSuffix(".json") }.sorted()
+                      if copias.count > 14 {
+                          for n in copias.prefix(copias.count - 14) {
+                              try? fm.removeItem(at: carpetaCopias.appendingPathComponent(n))
+                          }
+                      }
                   }
               }
 
@@ -248,6 +355,66 @@ jobs:
               return "Semana del \(fechaDia(s.weekStart)) al \(fechaLarga(addDays(s.weekStart, 4)))"
           }
           EOF_FILE
+          cat > Sources/Festivos.swift <<'EOF_FILE'
+          import Foundation
+
+          func fechaDe(_ y: Int, _ m: Int, _ d: Int) -> Date {
+              var comps = DateComponents()
+              comps.year = y
+              comps.month = m
+              comps.day = d
+              let f = calendarCO.date(from: comps) ?? Date()
+              return calendarCO.startOfDay(for: f)
+          }
+
+          func pascua(_ y: Int) -> Date {
+              let a = y % 19
+              let b = y / 100
+              let c = y % 100
+              let d = b / 4
+              let e = b % 4
+              let f = (b + 8) / 25
+              let g = (b - f + 1) / 3
+              let h = (19 * a + b - d - g + 15) % 30
+              let i = c / 4
+              let k = c % 4
+              let l = (32 + 2 * e + 2 * i - h - k) % 7
+              let m = (a + 11 * h + 22 * l) / 451
+              let mes = (h + l - 7 * m + 114) / 31
+              let dia = ((h + l - 7 * m + 114) % 31) + 1
+              return fechaDe(y, mes, dia)
+          }
+
+          func lunesSiguiente(_ d: Date) -> Date {
+              let wd = calendarCO.component(.weekday, from: d)
+              return addDays(d, (9 - wd) % 7)
+          }
+
+          // Festivos de Colombia (ley Emiliani): fijos, trasladados al lunes y de Semana Santa.
+          func festivosColombia(_ y: Int) -> [FreeDay] {
+              let p = pascua(y)
+              var lista: [(Date, String)] = []
+              lista.append((fechaDe(y, 1, 1), "Año Nuevo"))
+              lista.append((lunesSiguiente(fechaDe(y, 1, 6)), "Reyes Magos"))
+              lista.append((lunesSiguiente(fechaDe(y, 3, 19)), "San José"))
+              lista.append((addDays(p, -3), "Jueves Santo"))
+              lista.append((addDays(p, -2), "Viernes Santo"))
+              lista.append((fechaDe(y, 5, 1), "Día del Trabajo"))
+              lista.append((addDays(p, 43), "Ascensión del Señor"))
+              lista.append((addDays(p, 64), "Corpus Christi"))
+              lista.append((addDays(p, 71), "Sagrado Corazón"))
+              lista.append((lunesSiguiente(fechaDe(y, 6, 29)), "San Pedro y San Pablo"))
+              lista.append((fechaDe(y, 7, 20), "Día de la Independencia"))
+              lista.append((fechaDe(y, 8, 7), "Batalla de Boyacá"))
+              lista.append((lunesSiguiente(fechaDe(y, 8, 15)), "Asunción de la Virgen"))
+              lista.append((lunesSiguiente(fechaDe(y, 10, 12)), "Día de la Raza"))
+              lista.append((lunesSiguiente(fechaDe(y, 11, 1)), "Todos los Santos"))
+              lista.append((lunesSiguiente(fechaDe(y, 11, 11)), "Independencia de Cartagena"))
+              lista.append((fechaDe(y, 12, 8), "Inmaculada Concepción"))
+              lista.append((fechaDe(y, 12, 25), "Navidad"))
+              return lista.map { FreeDay(date: $0.0, reason: "Festivo: " + $0.1, scope: 0) }
+          }
+          EOF_FILE
           cat > Sources/Scheduler.swift <<'EOF_FILE'
           import Foundation
 
@@ -284,11 +451,13 @@ jobs:
                   let pos = i + 1
                   for a in s.assignments {
                       if a.absent { continue }
+                      if s.estado(a.day) == 1 { continue }
                       guard let z = a.zoneId else { continue }
                       h.zoneVisits[a.teacherId, default: [:]][z, default: 0] += 1
                       h.zoneLast[a.teacherId, default: [:]][z] = pos
                   }
-                  for r in s.rondas {
+                  for (d, r) in s.rondas.enumerated() {
+                      if s.estado(d) != 0 { continue }
                       if let a = r.a {
                           h.rondaCount[a, default: 0] += 1
                           h.rondaLast[a] = pos
@@ -398,18 +567,29 @@ jobs:
               return c
           }
 
+          // Un docente puede hacer ronda general ese día si no es "solo zona", no tiene zona ese día
+          // (salvo que sea "solo ronda") y no tiene una novedad registrada.
+          func puedeRonda(_ t: Teacher, _ d: Int, _ lunes: Date) -> Bool {
+              if t.modo == 2 { return false }
+              if t.modo != 1 && t.day == d { return false }
+              return !isAbsent(t, on: addDays(lunes, d))
+          }
+
           // MARK: - Ronda general (asignación conjunta de toda la semana)
 
-          func asignarRondas(docentes: [Teacher], lunes: Date, hist: HistoryStats) -> (rondas: [Ronda], avisos: [String]) {
+          func asignarRondas(docentes todos: [Teacher], lunes: Date, hist: HistoryStats, dias: [Int]) -> (rondas: [Ronda], avisos: [String]) {
               var avisos: [String] = []
-              var vacias: [Ronda] = []
-              for _ in 0..<5 { vacias.append(Ronda()) }
+              var resultado: [Ronda] = []
+              for _ in 0..<5 { resultado.append(Ronda()) }
+              if dias.isEmpty { return (resultado, avisos) }
+              let docentes = todos.filter { $0.modo != 2 }
               if docentes.count < 2 {
-                  avisos.append("Ronda general: se necesitan al menos dos docentes habilitados.")
-                  return (vacias, avisos)
+                  avisos.append("Ronda general: se necesitan al menos dos docentes habilitados para la ronda.")
+                  return (resultado, avisos)
               }
               let FORB = 1_000_000_000
-              let copias = max(1, (10 + docentes.count - 1) / docentes.count)
+              let cupos = dias.count * 2
+              let copias = max(1, (cupos + docentes.count - 1) / docentes.count)
               var columnas: [(Int, Int)] = []
               for c in 0..<copias {
                   for ti in 0..<docentes.count { columnas.append((ti, c)) }
@@ -417,13 +597,11 @@ jobs:
               var permitido: [[Bool]] = []
               for t in docentes {
                   var fila: [Bool] = []
-                  for d in 0..<5 {
-                      fila.append(t.day != d && !isAbsent(t, on: addDays(lunes, d)))
-                  }
+                  for d in 0..<5 { fila.append(puedeRonda(t, d, lunes)) }
                   permitido.append(fila)
               }
               var costos: [[Int]] = []
-              for d in 0..<5 {
+              for d in dias {
                   for _ in 0..<2 {
                       var fila: [Int] = []
                       for (ti, c) in columnas {
@@ -452,11 +630,10 @@ jobs:
                       elegidos.append(columnas[j].0)
                   }
               }
-              var resultado = vacias
               if hayHuecos {
-                  for d in 0..<5 {
-                      let x = elegidos[d * 2]
-                      let y = elegidos[d * 2 + 1]
+                  for (k, d) in dias.enumerated() {
+                      let x = elegidos[k * 2]
+                      let y = elegidos[k * 2 + 1]
                       resultado[d] = Ronda(a: x == nil ? nil : docentes[x!].id, b: y == nil ? nil : docentes[y!].id)
                       if x == nil || y == nil {
                           avisos.append("Ronda general del \(diasNombre[d].lowercased()): no hay suficientes docentes disponibles.")
@@ -464,19 +641,20 @@ jobs:
                   }
                   return (resultado, avisos)
               }
-              // Reacomodar los 10 elegidos en parejas por día para evitar parejas repetidas
+              // Reacomodar los elegidos en parejas por día para evitar parejas repetidas
               var disponibles: [Int] = []
               for e in elegidos { if let x = e { disponibles.append(x) } }
               var mejorCosto = Int.max
               var mejorArreglo: [(Int, Int)] = []
               var actual: [(Int, Int)] = []
-              func dfs(_ d: Int, _ resto: [Int], _ costo: Int) {
+              func dfs(_ k: Int, _ resto: [Int], _ costo: Int) {
                   if costo >= mejorCosto { return }
-                  if d == 5 {
+                  if k == dias.count {
                       mejorCosto = costo
                       mejorArreglo = actual
                       return
                   }
+                  let d = dias[k]
                   for i in 0..<resto.count {
                       for j in (i + 1)..<resto.count {
                           let a = resto[i]
@@ -486,22 +664,40 @@ jobs:
                           sobra.remove(at: j)
                           sobra.remove(at: i)
                           actual.append((a, b))
-                          dfs(d + 1, sobra, costo + costoPareja(docentes[a].id, docentes[b].id, hist))
+                          dfs(k + 1, sobra, costo + costoPareja(docentes[a].id, docentes[b].id, hist))
                           actual.removeLast()
                       }
                   }
               }
               dfs(0, disponibles, 0)
-              if mejorArreglo.count == 5 {
-                  for d in 0..<5 {
-                      resultado[d] = Ronda(a: docentes[mejorArreglo[d].0].id, b: docentes[mejorArreglo[d].1].id)
+              if mejorArreglo.count == dias.count {
+                  for (k, d) in dias.enumerated() {
+                      resultado[d] = Ronda(a: docentes[mejorArreglo[k].0].id, b: docentes[mejorArreglo[k].1].id)
                   }
               } else {
-                  for d in 0..<5 {
-                      resultado[d] = Ronda(a: docentes[elegidos[d * 2]!].id, b: docentes[elegidos[d * 2 + 1]!].id)
+                  for (k, d) in dias.enumerated() {
+                      resultado[d] = Ronda(a: docentes[elegidos[k * 2]!].id, b: docentes[elegidos[k * 2 + 1]!].id)
                   }
               }
               return (resultado, avisos)
+          }
+
+          // MARK: - Días sin acompañamiento de la semana
+
+          func estadosDeSemana(_ data: AppData, _ lunes: Date) -> (estado: [Int], nota: [String]) {
+              var est = [0, 0, 0, 0, 0]
+              var nota = ["", "", "", "", ""]
+              for d in 0..<5 {
+                  let fecha = addDays(lunes, d)
+                  for fd in data.freeDays where calendarCO.isDate(fd.date, inSameDayAs: fecha) {
+                      let nuevo = fd.scope == 0 ? 1 : 2
+                      if est[d] == 0 || nuevo == 1 {
+                          est[d] = nuevo
+                          nota[d] = fd.reason
+                      }
+                  }
+              }
+              return (est, nota)
           }
 
           // MARK: - Generación de la semana
@@ -511,6 +707,7 @@ jobs:
               let hist = buildHistory(data.schedules, before: lunes)
               let zonas = data.zones.filter { $0.active }
               let docentes = data.teachers.filter { $0.active }
+              let es = estadosDeSemana(data, lunes)
               var asignaciones: [Assignment] = []
               var avisos: [String] = []
 
@@ -518,7 +715,7 @@ jobs:
 
               for d in 0..<5 {
                   let fecha = addDays(lunes, d)
-                  let delDia = docentes.filter { $0.day == d }.sorted { $0.name < $1.name }
+                  let delDia = docentes.filter { $0.day == d && $0.modo != 1 }.sorted { $0.name < $1.name }
                   var ausentes: [Teacher] = []
                   var presentes: [Teacher] = []
                   for t in delDia {
@@ -527,7 +724,7 @@ jobs:
                   for t in ausentes {
                       asignaciones.append(Assignment(teacherId: t.id, day: d, zoneId: nil, absent: true))
                   }
-                  if !ausentes.isEmpty {
+                  if !ausentes.isEmpty && es.estado[d] != 1 {
                       let nombres = ausentes.map { $0.name }.joined(separator: ", ")
                       avisos.append("\(diasNombre[d]): ausentes \(nombres). Su zona debe cubrirse manualmente.")
                   }
@@ -559,10 +756,13 @@ jobs:
                   }
               }
 
-              let r = asignarRondas(docentes: docentes, lunes: lunes, hist: hist)
+              var diasRonda: [Int] = []
+              for d in 0..<5 { if es.estado[d] == 0 { diasRonda.append(d) } }
+              let r = asignarRondas(docentes: docentes, lunes: lunes, hist: hist, dias: diasRonda)
               avisos.append(contentsOf: r.avisos)
 
-              return Schedule(weekStart: lunes, jornada: jornada, assignments: asignaciones, rondas: r.rondas, warnings: avisos)
+              return Schedule(weekStart: lunes, jornada: jornada, assignments: asignaciones, rondas: r.rondas,
+                              warnings: avisos, dayStatus: es.estado, dayNote: es.nota)
           }
 
           // MARK: - Validación
@@ -590,9 +790,19 @@ jobs:
 
               for w in s.warnings { agregar(.aviso, w) }
 
+              for d in 0..<5 {
+                  if s.estado(d) == 1 {
+                      let motivo = s.nota(d).isEmpty ? "" : " (\(s.nota(d)))"
+                      agregar(.ok, "\(diasNombre[d]): sin acompañamiento\(motivo). No cuenta para la rotación.")
+                  } else if s.estado(d) == 2 {
+                      let motivo = s.nota(d).isEmpty ? "" : " (\(s.nota(d)))"
+                      agregar(.ok, "\(diasNombre[d]): sin ronda general\(motivo).")
+                  }
+              }
+
               // 1. Día fijo
               var problemas = 0
-              for a in s.assignments {
+              for a in s.assignments where s.estado(a.day) != 1 {
                   if let t = docente(a.teacherId), t.day != a.day {
                       problemas += 1
                       agregar(.error, "\(t.name) está programado el \(diasNombre[a.day]) pero su día fijo es el \(diasNombre[t.day]).")
@@ -602,7 +812,7 @@ jobs:
 
               // 2. Rotación de zonas
               problemas = 0
-              for a in s.assignments {
+              for a in s.assignments where s.estado(a.day) != 1 {
                   if a.absent { continue }
                   guard let z = a.zoneId, let t = docente(a.teacherId), !zonasActivas.isEmpty else { continue }
                   let visitas = zonasActivas.map { hist.zoneVisits[t.id]?[$0.id] ?? 0 }
@@ -621,7 +831,7 @@ jobs:
               // 3. Asignaciones incompatibles
               problemas = 0
               var vistos = Set<String>()
-              for a in s.assignments {
+              for a in s.assignments where s.estado(a.day) != 1 {
                   let k = a.teacherId.uuidString + "-\(a.day)"
                   if vistos.contains(k) {
                       problemas += 1
@@ -629,7 +839,7 @@ jobs:
                   }
                   vistos.insert(k)
               }
-              for d in 0..<5 {
+              for d in 0..<5 where s.estado(d) == 0 {
                   let r = s.ronda(d)
                   var ids: [UUID] = []
                   if let a = r.a { ids.append(a) }
@@ -649,18 +859,18 @@ jobs:
 
               // 4. Dos docentes por día en la ronda general
               problemas = 0
-              for d in 0..<5 {
+              for d in 0..<5 where s.estado(d) == 0 {
                   let r = s.ronda(d)
                   if r.a == nil || r.b == nil {
                       problemas += 1
                       agregar(.error, "La ronda general del \(diasNombre[d].lowercased()) no tiene dos docentes.")
                   }
               }
-              if problemas == 0 { agregar(.ok, "Cada día tiene exactamente dos docentes en la ronda general.") }
+              if problemas == 0 { agregar(.ok, "Cada día con ronda tiene exactamente dos docentes.") }
 
               // 5. Parejas repetidas
               problemas = 0
-              for d in 0..<5 {
+              for d in 0..<5 where s.estado(d) == 0 {
                   let r = s.ronda(d)
                   if let a = r.a, let b = r.b, let last = hist.pairLast[pairKey(a, b)] {
                       let hace = hist.count + 1 - last
@@ -677,13 +887,13 @@ jobs:
 
               // 6. Ausencias y restricciones
               problemas = 0
-              for a in s.assignments {
+              for a in s.assignments where s.estado(a.day) != 1 {
                   if let t = docente(a.teacherId), !a.absent, isAbsent(t, on: addDays(s.weekStart, a.day)) {
                       problemas += 1
                       agregar(.error, "\(t.name) tiene una novedad registrada el \(diasNombre[a.day].lowercased()) y aparece asignado.")
                   }
               }
-              for d in 0..<5 {
+              for d in 0..<5 where s.estado(d) == 0 {
                   let r = s.ronda(d)
                   for id in [r.a, r.b] {
                       if let t = docente(id), isAbsent(t, on: addDays(s.weekStart, d)) {
@@ -699,12 +909,12 @@ jobs:
 
               // 7. Equidad
               var cuenta: [UUID: Int] = hist.rondaCount
-              for d in 0..<5 {
+              for d in 0..<5 where s.estado(d) == 0 {
                   let r = s.ronda(d)
                   if let a = r.a { cuenta[a, default: 0] += 1 }
                   if let b = r.b { cuenta[b, default: 0] += 1 }
               }
-              let activos = data.teachers.filter { $0.active }
+              let activos = data.teachers.filter { $0.active && $0.modo != 2 }
               var equilibrado = true
               if activos.count > 1 {
                   let vals = activos.map { cuenta[$0.id] ?? 0 }
@@ -717,8 +927,8 @@ jobs:
 
               // 8. Cobertura de zonas
               problemas = 0
-              for d in 0..<5 {
-                  let hay = data.teachers.contains(where: { $0.active && $0.day == d })
+              for d in 0..<5 where s.estado(d) != 1 {
+                  let hay = data.teachers.contains(where: { $0.active && $0.day == d && $0.modo != 1 })
                   if !hay {
                       problemas += 1
                       agregar(.aviso, "No hay docentes con día fijo el \(diasNombre[d].lowercased()): las zonas quedan sin cobertura.")
@@ -732,7 +942,7 @@ jobs:
                       }
                   }
               }
-              if problemas == 0 { agregar(.ok, "Todas las zonas activas tienen cobertura todos los días.") }
+              if problemas == 0 { agregar(.ok, "Todas las zonas activas tienen cobertura los días de acompañamiento.") }
 
               return out
           }
@@ -743,6 +953,7 @@ jobs:
               var d = base
               d.schedules = []
               d.teachers = []
+              d.freeDays = []
               var n = 1
               for (dia, cantidad) in porDia.enumerated() {
                   for _ in 0..<cantidad {
@@ -751,6 +962,12 @@ jobs:
                   }
               }
               return d
+          }
+
+          func tamanoArchivo(_ u: URL) -> Int {
+              let attrs = try? FileManager.default.attributesOfItem(atPath: u.path)
+              if let n = attrs?[.size] as? NSNumber { return n.intValue }
+              return 0
           }
 
           @MainActor
@@ -777,6 +994,12 @@ jobs:
               }
               rep.append("Semanas simuladas: \(semanas)")
 
+              var libres = 0
+              for s in d.schedules {
+                  for dd in 0..<5 where s.estado(dd) != 0 { libres += 1 }
+              }
+              if libres > 0 { rep.append("Días sin acompañamiento o sin ronda en la simulación: \(libres)") }
+
               var malDia = 0
               for s in d.schedules {
                   for a in s.assignments {
@@ -786,10 +1009,10 @@ jobs:
               rep.append(malDia == 0 ? "✅ Cada docente conservó su día fijo todas las semanas." : "❌ \(malDia) asignaciones cambiaron de día.")
 
               var repetidas = 0
-              for t in activos {
+              for t in activos where t.modo != 1 {
                   var visitadas = Set<UUID>()
                   for s in d.schedules {
-                      for a in s.assignments where a.teacherId == t.id && !a.absent {
+                      for a in s.assignments where a.teacherId == t.id && !a.absent && s.estado(a.day) != 1 {
                           guard let z = a.zoneId else { continue }
                           if visitadas.contains(z) && visitadas.count < zonasActivas.count { repetidas += 1 }
                           visitadas.insert(z)
@@ -801,12 +1024,12 @@ jobs:
 
               var rondaMal = 0
               for s in d.schedules {
-                  for dd in 0..<5 {
+                  for dd in 0..<5 where s.estado(dd) == 0 {
                       let r = s.ronda(dd)
                       if r.a == nil || r.b == nil || r.a == r.b { rondaMal += 1 }
                   }
               }
-              rep.append(rondaMal == 0 ? "✅ Cada día tuvo dos docentes distintos en la ronda general." : "❌ \(rondaMal) días sin dos docentes en la ronda general.")
+              rep.append(rondaMal == 0 ? "✅ Cada día con ronda tuvo dos docentes distintos." : "❌ \(rondaMal) días sin dos docentes en la ronda general.")
 
               var consecutivas = 0
               var repetidasOcho = 0
@@ -814,7 +1037,7 @@ jobs:
               var previas = Set<String>()
               for (w, s) in d.schedules.enumerated() {
                   var actuales = Set<String>()
-                  for dd in 0..<5 {
+                  for dd in 0..<5 where s.estado(dd) == 0 {
                       let r = s.ronda(dd)
                       if let a = r.a, let b = r.b { actuales.insert(pairKey(a, b)) }
                   }
@@ -830,13 +1053,14 @@ jobs:
 
               var cuenta: [UUID: Int] = [:]
               for s in d.schedules {
-                  for dd in 0..<5 {
+                  for dd in 0..<5 where s.estado(dd) == 0 {
                       let r = s.ronda(dd)
                       if let a = r.a { cuenta[a, default: 0] += 1 }
                       if let b = r.b { cuenta[b, default: 0] += 1 }
                   }
               }
-              let vals = activos.map { cuenta[$0.id] ?? 0 }
+              let conRonda = activos.filter { $0.modo != 2 }
+              let vals = conRonda.map { cuenta[$0.id] ?? 0 }
               if let mx = vals.max(), let mn = vals.min() {
                   rep.append(mx - mn <= 1 ? "✅ Ronda general equitativa: entre \(mn) y \(mx) participaciones por docente." : "⚠️ Ronda general desigual: entre \(mn) y \(mx) participaciones.")
               }
@@ -874,18 +1098,23 @@ jobs:
               var lineas: [String] = ["PRUEBAS DE SIMULACIÓN (8 semanas consecutivas)"]
               lineas.append(contentsOf: simularEscenario("20 docentes, 4 por día (caso ideal)", datosDePrueba([4, 4, 4, 4, 4], real)))
               lineas.append(contentsOf: simularEscenario("20 docentes repartidos 6-5-4-3-2 (caso irregular)", datosDePrueba([6, 5, 4, 3, 2], real)))
+
+              var conLibres = datosDePrueba([4, 4, 4, 4, 4], real)
+              conLibres.teachers.append(Teacher(name: "Docente solo ronda 1", day: 0, mode: 1))
+              conLibres.teachers.append(Teacher(name: "Docente solo ronda 2", day: 0, mode: 1))
+              let inicio = mondayOf(Date())
+              conLibres.freeDays = [
+                  FreeDay(date: addDays(inicio, 16), reason: "Festivo de prueba", scope: 0),
+                  FreeDay(date: addDays(inicio, 32), reason: "Sin ronda de prueba", scope: 1)
+              ]
+              lineas.append(contentsOf: simularEscenario("Con un festivo, un día sin ronda y 2 docentes solo de ronda", conLibres))
+
               if real.teachers.contains(where: { $0.active }) {
                   lineas.append(contentsOf: simularEscenario("Tus docentes registrados", real))
               }
               lineas.append("")
               lineas.append("Nota: si una regla es imposible con el número de docentes de un día, la app la marca como aviso y propone la mejor distribución posible.")
               return lineas.joined(separator: "\n")
-          }
-
-          func tamanoArchivo(_ u: URL) -> Int {
-              let attrs = try? FileManager.default.attributesOfItem(atPath: u.path)
-              if let n = attrs?[.size] as? NSNumber { return n.intValue }
-              return 0
           }
           EOF_FILE
           cat > Sources/Exporter.swift <<'EOF_FILE'
@@ -900,12 +1129,22 @@ jobs:
               var filas: [[String]] = [["Nombre del docente", "Día de la semana", "Zona asignada"]]
               for d in 0..<5 {
                   let etiqueta = "\(diasNombre[d]) \(fechaDia(addDays(s.weekStart, d)))"
+                  let est = s.estado(d)
+                  let motivo = s.nota(d).isEmpty ? "" : " (\(s.nota(d)))"
+                  if est == 1 {
+                      filas.append(["—", etiqueta, "Sin acompañamiento" + motivo])
+                      continue
+                  }
                   for a in s.assignments where a.day == d {
                       filas.append([nombreDocente(a.teacherId, data), etiqueta, a.absent ? "Ausente (sin zona)" : nombreZona(a.zoneId, data)])
                   }
-                  let r = s.ronda(d)
-                  filas.append([nombreDocente(r.a, data), etiqueta, "Ronda general"])
-                  filas.append([nombreDocente(r.b, data), etiqueta, "Ronda general"])
+                  if est == 2 {
+                      filas.append(["—", etiqueta, "Sin ronda general" + motivo])
+                  } else {
+                      let r = s.ronda(d)
+                      filas.append([nombreDocente(r.a, data), etiqueta, "Ronda general"])
+                      filas.append([nombreDocente(r.b, data), etiqueta, "Ronda general"])
+                  }
               }
               return filas
           }
@@ -918,6 +1157,9 @@ jobs:
               filas.append([""])
               filas.append(contentsOf: tablaTexto(s, data))
               filas.append([""])
+              if !s.notes.isEmpty {
+                  filas.append(["Observaciones de la semana: " + s.notes])
+              }
               filas.append(["Observaciones: " + data.settings.observation])
               return filas
           }
@@ -1073,6 +1315,9 @@ jobs:
                       ForEach(0..<5, id: \.self) { d in
                           bloque(d)
                       }
+                      if !s.notes.isEmpty {
+                          Text("Observaciones de la semana: \(s.notes)").font(.system(size: 12)).padding(.top, 6)
+                      }
                       Text("Observaciones").font(.system(size: 13, weight: .bold)).padding(.top, 6)
                       Text(data.settings.observation).font(.system(size: 12))
                   }
@@ -1084,16 +1329,26 @@ jobs:
               }
 
               private func bloque(_ d: Int) -> some View {
-                  VStack(alignment: .leading, spacing: 0) {
+                  let est = s.estado(d)
+                  let motivo = s.nota(d).isEmpty ? "" : " (\(s.nota(d)))"
+                  return VStack(alignment: .leading, spacing: 0) {
                       Text("\(diasNombre[d]) \(fechaDia(addDays(s.weekStart, d)))")
                           .font(.system(size: 13, weight: .bold))
                           .padding(6)
                           .frame(maxWidth: .infinity, alignment: .leading)
                           .background(Color(red: 0.84, green: 0.89, blue: 0.98))
-                      ForEach(s.assignments.filter { $0.day == d }) { a in
-                          fila(nombreDocente(a.teacherId, data), a.absent ? "Ausente (sin zona)" : nombreZona(a.zoneId, data), negrita: false)
+                      if est == 1 {
+                          fila("Sin acompañamiento", s.nota(d), negrita: true)
+                      } else {
+                          ForEach(s.assignments.filter { $0.day == d }) { a in
+                              fila(nombreDocente(a.teacherId, data), a.absent ? "Ausente (sin zona)" : nombreZona(a.zoneId, data), negrita: false)
+                          }
+                          if est == 2 {
+                              fila("Ronda general", "Suprimida" + motivo, negrita: true)
+                          } else {
+                              fila("Ronda general", nombreDocente(s.ronda(d).a, data) + " y " + nombreDocente(s.ronda(d).b, data), negrita: true)
+                          }
                       }
-                      fila("Ronda general", nombreDocente(s.ronda(d).a, data) + " y " + nombreDocente(s.ronda(d).b, data), negrita: true)
                   }
                   .overlay(Rectangle().stroke(Color.gray.opacity(0.5), lineWidth: 0.7))
               }
@@ -1118,6 +1373,7 @@ jobs:
               case inicio = "Panel de inicio"
               case docentes = "Gestión de docentes"
               case zonas = "Gestión de zonas"
+              case festivos = "Festivos y días sin clase"
               case generar = "Generar programación"
               case ronda = "Ronda general"
               case historial = "Historial y estadísticas"
@@ -1131,6 +1387,7 @@ jobs:
                   case .inicio: return "house"
                   case .docentes: return "person.3"
                   case .zonas: return "map"
+                  case .festivos: return "calendar.badge.exclamationmark"
                   case .generar: return "calendar.badge.plus"
                   case .ronda: return "figure.walk"
                   case .historial: return "chart.bar"
@@ -1140,7 +1397,7 @@ jobs:
               }
 
               var esAdmin: Bool {
-                  return self == .docentes || self == .zonas || self == .generar || self == .config
+                  return self == .docentes || self == .zonas || self == .festivos || self == .generar || self == .config
               }
           }
 
@@ -1266,6 +1523,7 @@ jobs:
                       detalle
                           .frame(maxWidth: .infinity, maxHeight: .infinity)
                   }
+                  .avisoTexto($store.aviso)
               }
 
               @ViewBuilder
@@ -1277,6 +1535,7 @@ jobs:
                       case .inicio: InicioView(irGenerar: { seleccion = .generar })
                       case .docentes: DocentesView()
                       case .zonas: ZonasView()
+                      case .festivos: FestivosView()
                       case .generar: GenerarView()
                       case .ronda: RondaView()
                       case .historial: HistorialView()
@@ -1339,7 +1598,7 @@ jobs:
                   if store.data.zones.filter({ $0.active }).isEmpty { a.append("No hay zonas activas.") }
                   if !store.data.teachers.isEmpty {
                       for d in 0..<5 {
-                          let n = store.data.teachers.filter { $0.active && $0.day == d }.count
+                          let n = store.data.teachers.filter { $0.active && $0.day == d && $0.modo != 1 }.count
                           if n == 0 { a.append("No hay docentes con día fijo el \(diasNombre[d].lowercased()).") }
                       }
                   }
@@ -1371,7 +1630,7 @@ jobs:
                                       ForEach(0..<5, id: \.self) { d in
                                           VStack {
                                               Text(diasNombre[d]).font(.caption)
-                                              Text("\(store.data.teachers.filter { $0.active && $0.day == d }.count)").font(.title2).bold()
+                                              Text("\(store.data.teachers.filter { $0.active && $0.day == d && $0.modo != 1 }.count)").font(.title2).bold()
                                           }
                                           .frame(maxWidth: .infinity)
                                           .padding(8)
@@ -1441,7 +1700,7 @@ jobs:
                           Spacer()
                           Text("\(store.data.teachers.count) docentes registrados").foregroundColor(.secondary)
                       }
-                      Text("El día fijo no cambia solo: solo se modifica aquí, de forma manual. Para importar, usa un archivo con columnas «Nombre» y «Día» (lunes a viernes).")
+                      Text("El día fijo no cambia solo: solo se modifica aquí, de forma manual. «Solo ronda general» sirve para docentes sin zona fija (no usan día). Para importar, usa un archivo con columnas «Nombre» y «Día» (lunes a viernes).")
                           .font(.caption)
                           .foregroundColor(.secondary)
                       List {
@@ -1449,13 +1708,21 @@ jobs:
                               HStack {
                                   TextField("Nombre completo", text: $t.name)
                                       .frame(minWidth: 230)
+                                  Picker("", selection: Binding(get: { t.modo }, set: { $t.wrappedValue.mode = $0 })) {
+                                      ForEach(0..<3, id: \.self) { i in
+                                          Text(modosNombre[i]).tag(i)
+                                      }
+                                  }
+                                  .labelsHidden()
+                                  .frame(width: 190)
                                   Picker("", selection: $t.day) {
                                       ForEach(0..<5, id: \.self) { i in
                                           Text(diasNombre[i]).tag(i)
                                       }
                                   }
                                   .labelsHidden()
-                                  .frame(width: 130)
+                                  .frame(width: 120)
+                                  .disabled(t.modo == 1)
                                   Toggle("Activo", isOn: $t.active)
                                   Button("Ausencias (\(t.absences.count))") { ausencias = IdRef(id: t.id) }
                                   Button("Detalle") { detalle = IdRef(id: t.id) }
@@ -1674,62 +1941,96 @@ jobs:
               @Binding var s: Schedule
               let editable: Bool
 
+              private let nombresEstado = ["Día normal", "Sin acompañamiento", "Sin ronda general"]
+
               var body: some View {
                   VStack(alignment: .leading, spacing: 12) {
                       ForEach(0..<5, id: \.self) { d in
                           VStack(alignment: .leading, spacing: 6) {
-                              Text("\(diasNombre[d]) \(fechaDia(addDays(s.weekStart, d)))").font(.headline)
-                              ForEach($s.assignments) { $a in
-                                  if a.day == d {
+                              HStack {
+                                  Text("\(diasNombre[d]) \(fechaDia(addDays(s.weekStart, d)))").font(.headline)
+                                  Spacer()
+                                  if editable {
+                                      Picker("", selection: $s.dayStatus[d]) {
+                                          ForEach(0..<3, id: \.self) { k in
+                                              Text(nombresEstado[k]).tag(k)
+                                          }
+                                      }
+                                      .labelsHidden()
+                                      .frame(width: 210)
+                                  } else if s.estado(d) != 0 {
+                                      Text(nombresEstado[s.estado(d)]).foregroundColor(.orange)
+                                  }
+                              }
+                              if s.estado(d) != 0 {
+                                  if editable {
+                                      TextField("Motivo (festivo, sin clases…)", text: $s.dayNote[d])
+                                  } else if !s.nota(d).isEmpty {
+                                      Text(s.nota(d)).foregroundColor(.secondary)
+                                  }
+                              }
+                              if s.estado(d) != 1 {
+                                  ForEach($s.assignments) { $a in
+                                      if a.day == d {
+                                          HStack {
+                                              Text(store.nombreDocente(a.teacherId)).frame(width: 280, alignment: .leading)
+                                              if a.absent {
+                                                  Text("Ausente (sin zona)").foregroundColor(.orange)
+                                              } else if editable {
+                                                  Picker("", selection: $a.zoneId) {
+                                                      Text("Sin zona").tag(UUID?.none)
+                                                      ForEach(store.data.zones) { z in
+                                                          Text(z.name + (z.active ? "" : " (inactiva)")).tag(Optional(z.id))
+                                                      }
+                                                  }
+                                                  .labelsHidden()
+                                                  .frame(width: 340)
+                                              } else {
+                                                  Text(store.nombreZona(a.zoneId))
+                                              }
+                                              Spacer()
+                                          }
+                                      }
+                                  }
+                                  if s.estado(d) == 2 {
+                                      Text("Ronda general suprimida este día").foregroundColor(.secondary)
+                                  } else {
                                       HStack {
-                                          Text(store.nombreDocente(a.teacherId)).frame(width: 280, alignment: .leading)
-                                          if a.absent {
-                                              Text("Ausente (sin zona)").foregroundColor(.orange)
-                                          } else if editable {
-                                              Picker("", selection: $a.zoneId) {
-                                                  Text("Sin zona").tag(UUID?.none)
-                                                  ForEach(store.data.zones) { z in
-                                                      Text(z.name + (z.active ? "" : " (inactiva)")).tag(Optional(z.id))
+                                          Text("Ronda general").bold().frame(width: 280, alignment: .leading)
+                                          if editable {
+                                              Picker("", selection: $s.rondas[d].a) {
+                                                  Text("—").tag(UUID?.none)
+                                                  ForEach(store.data.teachers.filter { $0.active }) { t in
+                                                      Text(t.name).tag(Optional(t.id))
                                                   }
                                               }
                                               .labelsHidden()
-                                              .frame(width: 340)
+                                              .frame(width: 250)
+                                              Picker("", selection: $s.rondas[d].b) {
+                                                  Text("—").tag(UUID?.none)
+                                                  ForEach(store.data.teachers.filter { $0.active }) { t in
+                                                      Text(t.name).tag(Optional(t.id))
+                                                  }
+                                              }
+                                              .labelsHidden()
+                                              .frame(width: 250)
                                           } else {
-                                              Text(store.nombreZona(a.zoneId))
+                                              Text(store.nombreDocente(s.ronda(d).a) + " y " + store.nombreDocente(s.ronda(d).b)).bold()
                                           }
                                           Spacer()
                                       }
                                   }
-                              }
-                              HStack {
-                                  Text("Ronda general").bold().frame(width: 280, alignment: .leading)
-                                  if editable {
-                                      Picker("", selection: $s.rondas[d].a) {
-                                          Text("—").tag(UUID?.none)
-                                          ForEach(store.data.teachers.filter { $0.active }) { t in
-                                              Text(t.name).tag(Optional(t.id))
-                                          }
-                                      }
-                                      .labelsHidden()
-                                      .frame(width: 250)
-                                      Picker("", selection: $s.rondas[d].b) {
-                                          Text("—").tag(UUID?.none)
-                                          ForEach(store.data.teachers.filter { $0.active }) { t in
-                                              Text(t.name).tag(Optional(t.id))
-                                          }
-                                      }
-                                      .labelsHidden()
-                                      .frame(width: 250)
-                                  } else {
-                                      Text(store.nombreDocente(s.ronda(d).a) + " y " + store.nombreDocente(s.ronda(d).b)).bold()
-                                  }
-                                  Spacer()
                               }
                           }
                           .padding(12)
                           .frame(maxWidth: .infinity, alignment: .leading)
                           .background(Color.gray.opacity(0.12))
                           .cornerRadius(10)
+                      }
+                      if !s.notes.isEmpty {
+                          Text("Observaciones de la semana: " + s.notes)
+                              .font(.caption)
+                              .foregroundColor(.secondary)
                       }
                       Text("Observaciones: " + store.data.settings.observation)
                           .font(.caption)
@@ -1775,7 +2076,7 @@ jobs:
                                   }
                                   Text(etiquetaSemanaTexto)
                                       .foregroundColor(.secondary)
-                                  Text("\(store.data.teachers.filter { $0.active }.count) docentes habilitados · \(store.data.zones.filter { $0.active }.count) zonas activas · \(novedades) novedades esta semana")
+                                  Text("\(store.data.teachers.filter { $0.active }.count) docentes habilitados · \(store.data.zones.filter { $0.active }.count) zonas activas · \(novedades) novedades esta semana · \(diasLibres) días sin acompañamiento o sin ronda")
                                       .font(.caption)
                                       .foregroundColor(.secondary)
                                   Button {
@@ -1795,13 +2096,26 @@ jobs:
                                   Tarjeta("Resumen de validación") {
                                       ListaHallazgos(items: validar(s, store.data))
                                   }
-                                  Text(s.published ? "Programación publicada (no se puede modificar)." : "Borrador: puedes cambiar zonas y rondas antes de publicar.")
-                                      .foregroundColor(s.published ? .green : .orange)
+                                  if s.published {
+                                      HStack {
+                                          Text("Programación publicada.").foregroundColor(.green)
+                                          Button("Reabrir como borrador") {
+                                              store.data.schedules[i].published = false
+                                          }
+                                          Text("Úsalo solo si necesitas corregirla; después vuelve a publicarla.")
+                                              .font(.caption)
+                                              .foregroundColor(.secondary)
+                                      }
+                                  } else {
+                                      Text("Borrador: puedes cambiar zonas, rondas y el estado de cada día antes de publicar.")
+                                          .foregroundColor(.orange)
+                                      TextField("Observaciones de esta semana (opcional)", text: $store.data.schedules[i].notes)
+                                  }
                                   ProgramacionTabla(s: $store.data.schedules[i], editable: !s.published)
                                   if !s.published {
                                       HStack {
                                           Button("Publicar programación") {
-                                              let problemas = validar(s, store.data).filter { $0.nivel != .ok }
+                                              let problemas = validar(s, store.data).filter { $0.nivel == .aviso || $0.nivel == .error }
                                               if problemas.isEmpty { publicar(s.id) } else { confirmar = true }
                                           }
                                           .buttonStyle(.borderedProminent)
@@ -1848,11 +2162,16 @@ jobs:
                   return n
               }
 
+              private var diasLibres: Int {
+                  let es = estadosDeSemana(store.data, mondayOf(semana))
+                  return es.estado.filter { $0 != 0 }.count
+              }
+
               private func generar() {
                   let lunes = mondayOf(semana)
                   if let ex = existente(lunes) {
                       if ex.published {
-                          mensaje = "Esa semana ya está publicada y no se modifica. Elige otro lunes."
+                          mensaje = "Esa semana ya está publicada. Si necesitas corregirla, ábrela y toca «Reabrir como borrador»."
                           seleccionId = ex.id
                           return
                       }
@@ -1867,6 +2186,108 @@ jobs:
                   if let i = store.data.schedules.firstIndex(where: { $0.id == id }) {
                       store.data.schedules[i].published = true
                   }
+              }
+          }
+
+          // MARK: - Festivos y días sin clase
+
+          struct FestivosView: View {
+              @EnvironmentObject var store: Store
+              @State private var anio = Calendar.current.component(.year, from: Date())
+              @State private var desde = Date()
+              @State private var hasta = Date()
+              @State private var motivo = ""
+              @State private var alcance = 0
+              @State private var mensaje: String?
+
+              var body: some View {
+                  Pagina("Festivos y días sin clase") {
+                      Tarjeta("Agregar días") {
+                          HStack {
+                              DatePicker("Desde", selection: $desde, displayedComponents: .date)
+                              DatePicker("Hasta", selection: $hasta, displayedComponents: .date)
+                          }
+                          HStack {
+                              TextField("Motivo (festivo, sin clases, jornada pedagógica…)", text: $motivo)
+                              Picker("", selection: $alcance) {
+                                  Text("Todo el día").tag(0)
+                                  Text("Solo sin ronda general").tag(1)
+                              }
+                              .labelsHidden()
+                              .frame(width: 220)
+                              Button("Agregar") { agregar() }
+                          }
+                          HStack {
+                              Stepper("Año \(String(anio))", value: $anio, in: 2024...2040)
+                                  .frame(width: 160)
+                              Button("Cargar festivos de Colombia \(String(anio))") { cargarFestivos() }
+                          }
+                          Text("«Todo el día» quita zonas y ronda general ese día y no cuenta para la rotación. «Solo sin ronda general» deja las zonas y suprime la ronda. Los festivos se calculan con la ley colombiana (lunes festivos y Semana Santa); ajusta si tu institución usa otro calendario.")
+                              .font(.caption)
+                              .foregroundColor(.secondary)
+                      }
+                      List {
+                          ForEach($store.data.freeDays) { $f in
+                              HStack {
+                                  DatePicker("", selection: $f.date, displayedComponents: .date)
+                                      .labelsHidden()
+                                      .frame(width: 140)
+                                  Text(diaSemana(f.date)).frame(width: 90, alignment: .leading)
+                                  TextField("Motivo", text: $f.reason)
+                                  Picker("", selection: $f.scope) {
+                                      Text("Todo el día").tag(0)
+                                      Text("Solo sin ronda general").tag(1)
+                                  }
+                                  .labelsHidden()
+                                  .frame(width: 210)
+                                  Button {
+                                      store.data.freeDays.removeAll { $0.id == f.id }
+                                  } label: {
+                                      Image(systemName: "trash")
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  .avisoTexto($mensaje)
+              }
+
+              private func diaSemana(_ d: Date) -> String {
+                  return formateador("EEEE").string(from: d).capitalized
+              }
+
+              private func agregar() {
+                  var dia = calendarCO.startOfDay(for: desde)
+                  let fin = calendarCO.startOfDay(for: max(hasta, desde))
+                  var n = 0
+                  var guardia = 0
+                  while dia <= fin && guardia < 400 {
+                      let wd = calendarCO.component(.weekday, from: dia)
+                      let actual = dia
+                      let existe = store.data.freeDays.contains(where: { calendarCO.isDate($0.date, inSameDayAs: actual) })
+                      if wd >= 2 && wd <= 6 && !existe {
+                          store.data.freeDays.append(FreeDay(date: dia, reason: motivo.isEmpty ? "Sin clases" : motivo, scope: alcance))
+                          n += 1
+                      }
+                      dia = addDays(dia, 1)
+                      guardia += 1
+                  }
+                  store.data.freeDays.sort { $0.date < $1.date }
+                  mensaje = n == 0 ? "No se agregó ningún día (ya estaban o eran fin de semana)." : "Se agregaron \(n) días."
+              }
+
+              private func cargarFestivos() {
+                  var n = 0
+                  for f in festivosColombia(anio) {
+                      let wd = calendarCO.component(.weekday, from: f.date)
+                      let existe = store.data.freeDays.contains(where: { calendarCO.isDate($0.date, inSameDayAs: f.date) })
+                      if wd >= 2 && wd <= 6 && !existe {
+                          store.data.freeDays.append(f)
+                          n += 1
+                      }
+                  }
+                  store.data.freeDays.sort { $0.date < $1.date }
+                  mensaje = "Se cargaron \(n) festivos de \(String(anio)). Los festivos que caen en fin de semana no se incluyen."
               }
           }
 
@@ -2175,7 +2596,7 @@ jobs:
                                       }
                                       Button("Borrar todas las programaciones", role: .destructive) { confirmarBorrado = true }
                                   }
-                                  Text("Los datos se guardan automáticamente en este Mac, en la carpeta Application Support/Acompanamiento.")
+                                  Text("Los datos se guardan automáticamente en este Mac (Application Support/Acompanamiento). Además, cada día que abres la app se guarda una copia automática en la subcarpeta Copias, y se conservan las últimas 14.")
                                       .font(.caption)
                                       .foregroundColor(.secondary)
                               }
@@ -2250,6 +2671,7 @@ jobs:
           codesign --force --deep --sign - "$APP"
           ditto -c -k --sequesterRsrc --keepParent "$APP" Acompanamiento.zip
           ls -la Acompanamiento.zip
+
 
 
       - uses: actions/upload-artifact@v4
