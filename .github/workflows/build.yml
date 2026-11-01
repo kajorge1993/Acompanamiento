@@ -575,9 +575,81 @@ jobs:
               return !isAbsent(t, on: addDays(lunes, d))
           }
 
+          // MARK: - Redistribución por días no lectivos
+
+          // Resumen de los docentes cuyo día fijo quedó sin clases (festivo, jornada institucional...).
+          // Ellos no hacen zona ni ronda ese día y solo pueden recuperar su participación en la ronda
+          // general de los días con clase. Sus zonas y las de los demás docentes NO se reprograman.
+          struct ResumenRedistribucion {
+              var diasNoLectivos: [Int] = []
+              var diasConRonda: [Int] = []
+              var afectados: [Teacher] = []
+              var aptos: [Teacher] = []
+              var soloZona: [Teacher] = []
+
+              var cupos: Int { return diasConRonda.count * 2 }
+          }
+
+          // Docentes activos con zona fija en un día completamente no lectivo (estado 1).
+          // Los de "solo ronda general" no tienen día fijo, por eso no cuentan como afectados.
+          func docentesAfectados(_ docentes: [Teacher], _ estados: [Int]) -> [Teacher] {
+              return docentes.filter { t in
+                  t.active && t.modo != 1 && t.day >= 0 && t.day < estados.count && estados[t.day] == 1
+              }
+          }
+
+          func analizarRedistribucion(estados: [Int], docentes: [Teacher]) -> ResumenRedistribucion {
+              var r = ResumenRedistribucion()
+              for d in 0..<5 {
+                  let e = d < estados.count ? estados[d] : 0
+                  if e == 1 { r.diasNoLectivos.append(d) }
+                  if e == 0 { r.diasConRonda.append(d) }
+              }
+              let lista = docentesAfectados(docentes, estados).sorted { $0.name < $1.name }
+              r.afectados = lista
+              r.aptos = lista.filter { $0.modo != 2 }
+              r.soloZona = lista.filter { $0.modo == 2 }
+              return r
+          }
+
+          func hallazgosRedistribucion(_ r: ResumenRedistribucion) -> [Hallazgo] {
+              var out: [Hallazgo] = []
+              if r.diasNoLectivos.isEmpty { return out }
+              let diasTxt = r.diasNoLectivos.map { diasNombre[$0] }.joined(separator: ", ")
+              out.append(Hallazgo(nivel: .ok, texto: "Días no lectivos: \(diasTxt). Las zonas de los demás días no se reprograman."))
+              let nombres = r.aptos.map { $0.name }.joined(separator: ", ")
+              if r.aptos.isEmpty {
+                  out.append(Hallazgo(nivel: .ok, texto: "No hay docentes que deban redistribuirse en la ronda general."))
+              } else {
+                  out.append(Hallazgo(nivel: .ok, texto: "Docentes que deben redistribuirse en la ronda general: \(r.aptos.count) (\(nombres))."))
+              }
+              if r.diasConRonda.isEmpty {
+                  if !r.aptos.isEmpty {
+                      out.append(Hallazgo(nivel: .aviso, texto: "No quedan días con clase y ronda general: los docentes afectados no pueden recuperar su turno."))
+                  }
+              } else {
+                  out.append(Hallazgo(nivel: .ok, texto: "Cupos de ronda general en los días con clase: \(r.cupos) (\(r.diasConRonda.count) días × 2 docentes)."))
+                  if r.aptos.count > r.cupos {
+                      out.append(Hallazgo(nivel: .aviso, texto: "No hay cupos suficientes: faltan \(r.aptos.count - r.cupos) cupos para que todos los afectados hagan ronda general esta semana."))
+                  } else if !r.aptos.isEmpty {
+                      out.append(Hallazgo(nivel: .ok, texto: "Hay cupos suficientes: cada docente afectado hará un solo turno de ronda general (quedan \(r.cupos - r.aptos.count) cupos para los demás docentes)."))
+                  }
+              }
+              if !r.soloZona.isEmpty {
+                  let n = r.soloZona.map { $0.name }.joined(separator: ", ")
+                  out.append(Hallazgo(nivel: .aviso, texto: "\(n): configurado(s) como «Solo zona», no puede(n) pasar a la ronda general. Si quieres que recuperen turno, cambia su modo en Gestión de docentes."))
+              }
+              return out
+          }
+
           // MARK: - Ronda general (asignación conjunta de toda la semana)
 
-          func asignarRondas(docentes todos: [Teacher], lunes: Date, hist: HistoryStats, dias: [Int]) -> (rondas: [Ronda], avisos: [String]) {
+          // Regla especial de días no lectivos:
+          //  1. Los docentes afectados (su día fijo no tiene clases) se colocan primero, un solo turno cada uno,
+          //     repartidos de forma pareja entre los días con clase y evitando parejas repetidas.
+          //  2. Los cupos restantes se llenan con los demás docentes según el historial de rondas.
+          //  3. Nadie recibe zonas nuevas: esta función solo toca la ronda general.
+          func asignarRondas(docentes todos: [Teacher], lunes: Date, hist: HistoryStats, dias: [Int], afectados: [Teacher] = []) -> (rondas: [Ronda], avisos: [String]) {
               var avisos: [String] = []
               var resultado: [Ronda] = []
               for _ in 0..<5 { resultado.append(Ronda()) }
@@ -588,36 +660,114 @@ jobs:
                   return (resultado, avisos)
               }
               let FORB = 1_000_000_000
-              let cupos = dias.count * 2
-              let copias = max(1, (cupos + docentes.count - 1) / docentes.count)
-              var columnas: [(Int, Int)] = []
-              for c in 0..<copias {
-                  for ti in 0..<docentes.count { columnas.append((ti, c)) }
-              }
-              var permitido: [[Bool]] = []
+              let idsAfectados = Set(afectados.map { $0.id })
+
+              var permitidoDe: [UUID: [Bool]] = [:]
               for t in docentes {
                   var fila: [Bool] = []
                   for d in 0..<5 { fila.append(puedeRonda(t, d, lunes)) }
-                  permitido.append(fila)
+                  permitidoDe[t.id] = fila
+              }
+
+              func volcar(_ m: [Int: [UUID]]) {
+                  for d in dias {
+                      let ids = m[d] ?? []
+                      resultado[d] = Ronda(a: ids.count > 0 ? ids[0] : nil, b: ids.count > 1 ? ids[1] : nil)
+                  }
+              }
+
+              // FASE A: docentes afectados por días no lectivos (un turno cada uno, repartidos entre los días con clase)
+              var aptos = docentes.filter { idsAfectados.contains($0.id) }
+              aptos.sort { x, y in
+                  let cx = hist.rondaCount[x.id] ?? 0
+                  let cy = hist.rondaCount[y.id] ?? 0
+                  return cx != cy ? cx < cy : x.name < y.name
+              }
+              let cuposTotales = dias.count * 2
+              if aptos.count > cuposTotales { aptos = Array(aptos.prefix(cuposTotales)) }
+
+              var carga = [Int](repeating: 0, count: 5)
+              var ocupantes: [Int: [UUID]] = [:]
+              var actualA: [Int?] = [Int?](repeating: nil, count: aptos.count)
+              var mejorA: [Int?] = actualA
+              var mejorCostoA = Int.max
+              let rot = hist.count % dias.count
+
+              func colocar(_ i: Int, _ costo: Int) {
+                  if costo >= mejorCostoA { return }
+                  if i == aptos.count {
+                      mejorCostoA = costo
+                      mejorA = actualA
+                      return
+                  }
+                  let t = aptos[i]
+                  let ok = permitidoDe[t.id] ?? [false, false, false, false, false]
+                  var alguno = false
+                  for (pos, d) in dias.enumerated() {
+                      if carga[d] >= 2 || !ok[d] { continue }
+                      alguno = true
+                      var c = carga[d] * 10_000 + ((pos - rot + dias.count) % dias.count)
+                      if let otro = ocupantes[d]?.first { c += costoPareja(otro, t.id, hist) }
+                      carga[d] += 1
+                      ocupantes[d, default: []].append(t.id)
+                      actualA[i] = d
+                      colocar(i + 1, costo + c)
+                      actualA[i] = nil
+                      ocupantes[d]?.removeLast()
+                      carga[d] -= 1
+                  }
+                  if !alguno {
+                      actualA[i] = nil
+                      colocar(i + 1, costo + 5_000_000)
+                  }
+              }
+              colocar(0, 0)
+
+              var fijos: [Int: [UUID]] = [:]
+              for (i, t) in aptos.enumerated() {
+                  if let d = mejorA[i] { fijos[d, default: []].append(t.id) }
+              }
+
+              // FASE B: cupos restantes con los demás docentes
+              let pool = docentes.filter { !idsAfectados.contains($0.id) }
+              var libres: [Int] = []
+              for d in dias {
+                  let ocupados = fijos[d]?.count ?? 0
+                  for _ in 0..<max(0, 2 - ocupados) { libres.append(d) }
+              }
+              if libres.isEmpty {
+                  volcar(fijos)
+                  return (resultado, avisos)
+              }
+              if pool.isEmpty {
+                  volcar(fijos)
+                  for d in dias where (fijos[d]?.count ?? 0) < 2 {
+                      avisos.append("Ronda general del \(diasNombre[d].lowercased()): no hay suficientes docentes disponibles.")
+                  }
+                  return (resultado, avisos)
+              }
+
+              let copias = max(1, (libres.count + pool.count - 1) / pool.count)
+              var columnas: [(Int, Int)] = []
+              for c in 0..<copias {
+                  for ti in 0..<pool.count { columnas.append((ti, c)) }
               }
               var costos: [[Int]] = []
-              for d in dias {
-                  for _ in 0..<2 {
-                      var fila: [Int] = []
-                      for (ti, c) in columnas {
-                          if !permitido[ti][d] {
-                              fila.append(FORB)
-                          } else {
-                              let t = docentes[ti]
-                              var base = (hist.rondaCount[t.id] ?? 0) * 1000
-                              if let last = hist.rondaLast[t.id] {
-                                  base += max(0, 20 - (hist.count + 1 - last)) * 20
-                              }
-                              fila.append(base + c * 100000)
+              for d in libres {
+                  var fila: [Int] = []
+                  for (ti, c) in columnas {
+                      let t = pool[ti]
+                      if !(permitidoDe[t.id]?[d] ?? false) {
+                          fila.append(FORB)
+                      } else {
+                          var base = (hist.rondaCount[t.id] ?? 0) * 1000
+                          if let last = hist.rondaLast[t.id] {
+                              base += max(0, 20 - (hist.count + 1 - last)) * 20
                           }
+                          fila.append(base + c * 100000)
                       }
-                      costos.append(fila)
                   }
+                  costos.append(fila)
               }
               let sol = hungarian(costos)
               var elegidos: [Int?] = []
@@ -631,22 +781,22 @@ jobs:
                   }
               }
               if hayHuecos {
-                  for (k, d) in dias.enumerated() {
-                      let x = elegidos[k * 2]
-                      let y = elegidos[k * 2 + 1]
-                      resultado[d] = Ronda(a: x == nil ? nil : docentes[x!].id, b: y == nil ? nil : docentes[y!].id)
-                      if x == nil || y == nil {
-                          avisos.append("Ronda general del \(diasNombre[d].lowercased()): no hay suficientes docentes disponibles.")
-                      }
+                  var m = fijos
+                  for (i, d) in libres.enumerated() {
+                      if let x = elegidos[i] { m[d, default: []].append(pool[x].id) }
+                  }
+                  volcar(m)
+                  for d in dias where (m[d]?.count ?? 0) < 2 {
+                      avisos.append("Ronda general del \(diasNombre[d].lowercased()): no hay suficientes docentes disponibles.")
                   }
                   return (resultado, avisos)
               }
-              // Reacomodar los elegidos en parejas por día para evitar parejas repetidas
-              var disponibles: [Int] = []
-              for e in elegidos { if let x = e { disponibles.append(x) } }
+
+              // Reacomodar los elegidos en los días para evitar parejas repetidas (los afectados quedan en su día)
+              let disponibles: [Int] = elegidos.compactMap { $0 }
               var mejorCosto = Int.max
-              var mejorArreglo: [(Int, Int)] = []
-              var actual: [(Int, Int)] = []
+              var mejorArreglo: [[Int]] = []
+              var actual: [[Int]] = []
               func dfs(_ k: Int, _ resto: [Int], _ costo: Int) {
                   if costo >= mejorCosto { return }
                   if k == dias.count {
@@ -655,30 +805,52 @@ jobs:
                       return
                   }
                   let d = dias[k]
-                  for i in 0..<resto.count {
-                      for j in (i + 1)..<resto.count {
+                  let f = fijos[d] ?? []
+                  let faltan = 2 - f.count
+                  if faltan <= 0 {
+                      actual.append([])
+                      dfs(k + 1, resto, costo + (f.count >= 2 ? costoPareja(f[0], f[1], hist) : 0))
+                      actual.removeLast()
+                  } else if faltan == 1 {
+                      for i in 0..<resto.count {
                           let a = resto[i]
-                          let b = resto[j]
-                          if a == b || !permitido[a][d] || !permitido[b][d] { continue }
+                          if !(permitidoDe[pool[a].id]?[d] ?? false) { continue }
                           var sobra = resto
-                          sobra.remove(at: j)
                           sobra.remove(at: i)
-                          actual.append((a, b))
-                          dfs(k + 1, sobra, costo + costoPareja(docentes[a].id, docentes[b].id, hist))
+                          actual.append([a])
+                          dfs(k + 1, sobra, costo + costoPareja(f[0], pool[a].id, hist))
                           actual.removeLast()
+                      }
+                  } else {
+                      for i in 0..<resto.count {
+                          for j in (i + 1)..<resto.count {
+                              let a = resto[i]
+                              let b = resto[j]
+                              if pool[a].id == pool[b].id { continue }
+                              if !(permitidoDe[pool[a].id]?[d] ?? false) || !(permitidoDe[pool[b].id]?[d] ?? false) { continue }
+                              var sobra = resto
+                              sobra.remove(at: j)
+                              sobra.remove(at: i)
+                              actual.append([a, b])
+                              dfs(k + 1, sobra, costo + costoPareja(pool[a].id, pool[b].id, hist))
+                              actual.removeLast()
+                          }
                       }
                   }
               }
               dfs(0, disponibles, 0)
+
+              var m = fijos
               if mejorArreglo.count == dias.count {
                   for (k, d) in dias.enumerated() {
-                      resultado[d] = Ronda(a: docentes[mejorArreglo[k].0].id, b: docentes[mejorArreglo[k].1].id)
+                      for i in mejorArreglo[k] { m[d, default: []].append(pool[i].id) }
                   }
               } else {
-                  for (k, d) in dias.enumerated() {
-                      resultado[d] = Ronda(a: docentes[elegidos[k * 2]!].id, b: docentes[elegidos[k * 2 + 1]!].id)
+                  for (i, d) in libres.enumerated() {
+                      if let x = elegidos[i] { m[d, default: []].append(pool[x].id) }
                   }
               }
+              volcar(m)
               return (resultado, avisos)
           }
 
@@ -713,6 +885,8 @@ jobs:
 
               if zonas.isEmpty { avisos.append("No hay zonas activas: no se pueden asignar zonas.") }
 
+              // Las zonas se calculan igual que siempre, sin importar los días no lectivos:
+              // un día excluido nunca hace que se reprogramen los acompañamientos por zona de otros días.
               for d in 0..<5 {
                   let fecha = addDays(lunes, d)
                   let delDia = docentes.filter { $0.day == d && $0.modo != 1 }.sorted { $0.name < $1.name }
@@ -758,7 +932,8 @@ jobs:
 
               var diasRonda: [Int] = []
               for d in 0..<5 { if es.estado[d] == 0 { diasRonda.append(d) } }
-              let r = asignarRondas(docentes: docentes, lunes: lunes, hist: hist, dias: diasRonda)
+              let afectados = docentesAfectados(docentes, es.estado)
+              let r = asignarRondas(docentes: docentes, lunes: lunes, hist: hist, dias: diasRonda, afectados: afectados)
               avisos.append(contentsOf: r.avisos)
 
               return Schedule(weekStart: lunes, jornada: jornada, assignments: asignaciones, rondas: r.rondas,
@@ -944,6 +1119,50 @@ jobs:
               }
               if problemas == 0 { agregar(.ok, "Todas las zonas activas tienen cobertura los días de acompañamiento.") }
 
+              // 9. Redistribución por días no lectivos
+              let resumen = analizarRedistribucion(estados: (0..<5).map { s.estado($0) }, docentes: data.teachers.filter { $0.active })
+              if !resumen.diasNoLectivos.isEmpty {
+                  for h in hallazgosRedistribucion(resumen) { out.append(h) }
+                  if !resumen.aptos.isEmpty && !resumen.diasConRonda.isEmpty {
+                      problemas = 0
+                      var porDia: [Int: Int] = [:]
+                      for t in resumen.aptos {
+                          var turnos = 0
+                          for d in resumen.diasConRonda {
+                              let r = s.ronda(d)
+                              if r.a == t.id || r.b == t.id {
+                                  turnos += 1
+                                  porDia[d, default: 0] += 1
+                              }
+                          }
+                          if turnos == 0 {
+                              let libreAlgunDia = resumen.diasConRonda.contains { !isAbsent(t, on: addDays(s.weekStart, $0)) }
+                              problemas += 1
+                              if resumen.aptos.count > resumen.cupos {
+                                  agregar(.aviso, "\(t.name) no alcanzó cupo para recuperar su turno en la ronda general esta semana.")
+                              } else if !libreAlgunDia {
+                                  agregar(.aviso, "\(t.name) tiene novedades todos los días con clase y no pudo recuperar su turno en la ronda general.")
+                              } else {
+                                  agregar(.error, "\(t.name) perdió su día por ser no lectivo y no quedó en la ronda general de los días con clase.")
+                              }
+                          } else if turnos > 1 {
+                              problemas += 1
+                              agregar(.aviso, "\(t.name) tiene \(turnos) turnos de ronda general esta semana; debería tener uno solo.")
+                          }
+                      }
+                      if resumen.aptos.count <= resumen.cupos {
+                          let vals = resumen.diasConRonda.map { porDia[$0] ?? 0 }
+                          if let mx = vals.max(), let mn = vals.min(), mx - mn > 1 {
+                              problemas += 1
+                              agregar(.aviso, "Los docentes de días no lectivos no quedaron repartidos de forma pareja entre los días con clase.")
+                          }
+                      }
+                      if problemas == 0 {
+                          agregar(.ok, "Los docentes de días no lectivos recuperaron su participación solo en la ronda general: un turno cada uno, repartidos entre los días con clase y sin zonas nuevas.")
+                      }
+                  }
+              }
+
               return out
           }
 
@@ -1031,6 +1250,22 @@ jobs:
               }
               rep.append(rondaMal == 0 ? "✅ Cada día con ronda tuvo dos docentes distintos." : "❌ \(rondaMal) días sin dos docentes en la ronda general.")
 
+              var hayNoLectivos = false
+              var sinRecuperar = 0
+              for s in d.schedules {
+                  let r = analizarRedistribucion(estados: (0..<5).map { s.estado($0) }, docentes: d.teachers.filter { $0.active })
+                  if r.diasNoLectivos.isEmpty { continue }
+                  hayNoLectivos = true
+                  if r.aptos.count > r.cupos { continue }
+                  for t in r.aptos {
+                      let n = r.diasConRonda.filter { s.ronda($0).a == t.id || s.ronda($0).b == t.id }.count
+                      if n != 1 { sinRecuperar += 1 }
+                  }
+              }
+              if hayNoLectivos {
+                  rep.append(sinRecuperar == 0 ? "✅ Los docentes de días no lectivos recuperaron un solo turno en la ronda general." : "❌ \(sinRecuperar) docentes de días no lectivos no quedaron con exactamente un turno de ronda general.")
+              }
+
               var consecutivas = 0
               var repetidasOcho = 0
               var ultimaVez: [String: Int] = [:]
@@ -1108,6 +1343,10 @@ jobs:
                   FreeDay(date: addDays(inicio, 32), reason: "Sin ronda de prueba", scope: 1)
               ]
               lineas.append(contentsOf: simularEscenario("Con un festivo, un día sin ronda y 2 docentes solo de ronda", conLibres))
+
+              var conFestivos = datosDePrueba([4, 4, 4, 4, 4], real)
+              conFestivos.freeDays = [0, 8, 16, 24, 32].map { FreeDay(date: addDays(inicio, $0), reason: "Festivo de prueba", scope: 0) }
+              lineas.append(contentsOf: simularEscenario("Un día no lectivo en varias semanas (redistribución en la ronda general)", conFestivos, semanas: 6))
 
               if real.teachers.contains(where: { $0.active }) {
                   lineas.append(contentsOf: simularEscenario("Tus docentes registrados", real))
@@ -2091,6 +2330,15 @@ jobs:
                                   .controlSize(.large)
                               }
 
+                              Tarjeta("Redistribución por días no lectivos") {
+                                  if resumenSemana.diasNoLectivos.isEmpty {
+                                      Text("Esta semana no tiene días no lectivos: no hay docentes por redistribuir.")
+                                          .foregroundColor(.secondary)
+                                  } else {
+                                      ListaHallazgos(items: hallazgosRedistribucion(resumenSemana))
+                                  }
+                              }
+
                               if let i = indice {
                                   let s = store.data.schedules[i]
                                   Tarjeta("Resumen de validación") {
@@ -2167,6 +2415,11 @@ jobs:
                   return es.estado.filter { $0 != 0 }.count
               }
 
+              private var resumenSemana: ResumenRedistribucion {
+                  let es = estadosDeSemana(store.data, mondayOf(semana))
+                  return analizarRedistribucion(estados: es.estado, docentes: store.data.teachers.filter { $0.active })
+              }
+
               private func generar() {
                   let lunes = mondayOf(semana)
                   if let ex = existente(lunes) {
@@ -2222,7 +2475,7 @@ jobs:
                                   .frame(width: 160)
                               Button("Cargar festivos de Colombia \(String(anio))") { cargarFestivos() }
                           }
-                          Text("«Todo el día» quita zonas y ronda general ese día y no cuenta para la rotación. «Solo sin ronda general» deja las zonas y suprime la ronda. Los festivos se calculan con la ley colombiana (lunes festivos y Semana Santa); ajusta si tu institución usa otro calendario.")
+                          Text("«Todo el día» quita zonas y ronda general ese día y no cuenta para la rotación; los docentes de ese día pasan a la ronda general de los días con clase (un turno cada uno), sin cambiar ninguna zona. «Solo sin ronda general» deja las zonas y suprime la ronda. Los festivos se calculan con la ley colombiana (lunes festivos y Semana Santa); ajusta si tu institución usa otro calendario.")
                               .font(.caption)
                               .foregroundColor(.secondary)
                       }
@@ -2601,7 +2854,7 @@ jobs:
                                       .foregroundColor(.secondary)
                               }
                               Tarjeta("Pruebas del algoritmo") {
-                                  Text("Simula 8 semanas consecutivas y verifica días fijos, rotación, ronda general, parejas y exportaciones.")
+                                  Text("Simula 8 semanas consecutivas y verifica días fijos, rotación, ronda general, parejas, días no lectivos y exportaciones.")
                                   Button("Ejecutar pruebas de 8 semanas") {
                                       reporte = ejecutarPruebas(store.data)
                                   }
