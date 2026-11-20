@@ -153,10 +153,13 @@ jobs:
               // Por día: 0 = normal, 1 = sin acompañamiento, 2 = sin ronda general
               var dayStatus: [Int]
               var dayNote: [String]
+              // Si no es nil, la semana se generó solo para estos docentes (filtro del panel de generación)
+              var teacherFilter: [UUID]?
 
               init(id: UUID = UUID(), weekStart: Date, jornada: String, assignments: [Assignment], rondas: [Ronda],
                    published: Bool = false, notes: String = "", warnings: [String] = [],
-                   dayStatus: [Int] = [0, 0, 0, 0, 0], dayNote: [String] = ["", "", "", "", ""]) {
+                   dayStatus: [Int] = [0, 0, 0, 0, 0], dayNote: [String] = ["", "", "", "", ""],
+                   teacherFilter: [UUID]? = nil) {
                   self.id = id
                   self.weekStart = weekStart
                   self.jornada = jornada
@@ -167,10 +170,11 @@ jobs:
                   self.warnings = warnings
                   self.dayStatus = dayStatus
                   self.dayNote = dayNote
+                  self.teacherFilter = teacherFilter
               }
 
               enum CodingKeys: String, CodingKey {
-                  case id, weekStart, jornada, assignments, rondas, published, notes, warnings, dayStatus, dayNote
+                  case id, weekStart, jornada, assignments, rondas, published, notes, warnings, dayStatus, dayNote, teacherFilter
               }
 
               init(from decoder: Decoder) throws {
@@ -185,6 +189,7 @@ jobs:
                   warnings = try c.decodeIfPresent([String].self, forKey: .warnings) ?? []
                   dayStatus = try c.decodeIfPresent([Int].self, forKey: .dayStatus) ?? [0, 0, 0, 0, 0]
                   dayNote = try c.decodeIfPresent([String].self, forKey: .dayNote) ?? ["", "", "", "", ""]
+                  teacherFilter = try c.decodeIfPresent([UUID].self, forKey: .teacherFilter)
               }
 
               func ronda(_ d: Int) -> Ronda {
@@ -261,6 +266,8 @@ jobs:
               @Published var unlocked = false
               @Published var requestedWeek: Date? = nil
               @Published var aviso: String? = nil
+              // Selección de docentes del panel de generación (solo en memoria; vacío = sin filtro)
+              @Published var filtroDocentes: Set<UUID> = []
               private let url: URL
               private let carpetaCopias: URL
 
@@ -872,13 +879,27 @@ jobs:
               return (est, nota)
           }
 
+          // MARK: - Filtro de docentes del panel de generación
+
+          // Devuelve el conjunto de docentes a programar, o nil si no hay filtro (comportamiento de siempre).
+          // Sin selección, o con todos los docentes habilitados seleccionados, no se filtra nada.
+          func filtroDocentesEfectivo(_ data: AppData, _ seleccion: Set<UUID>) -> Set<UUID>? {
+              let activos = Set(data.teachers.filter { $0.active }.map { $0.id })
+              let sel = seleccion.intersection(activos)
+              if sel.isEmpty || sel.isSuperset(of: activos) { return nil }
+              return sel
+          }
+
           // MARK: - Generación de la semana
 
-          func generarSemana(_ data: AppData, weekStart: Date, jornada: String) -> Schedule {
+          func generarSemana(_ data: AppData, weekStart: Date, jornada: String, docentesIds: Set<UUID>? = nil) -> Schedule {
               let lunes = mondayOf(weekStart)
               let hist = buildHistory(data.schedules, before: lunes)
               let zonas = data.zones.filter { $0.active }
-              let docentes = data.teachers.filter { $0.active }
+              // Filtro opcional: solo se programan los docentes seleccionados (nil = todos, como siempre)
+              let docentes = data.teachers.filter { t in
+                  t.active && (docentesIds?.contains(t.id) ?? true)
+              }
               let es = estadosDeSemana(data, lunes)
               var asignaciones: [Assignment] = []
               var avisos: [String] = []
@@ -937,7 +958,8 @@ jobs:
               avisos.append(contentsOf: r.avisos)
 
               return Schedule(weekStart: lunes, jornada: jornada, assignments: asignaciones, rondas: r.rondas,
-                              warnings: avisos, dayStatus: es.estado, dayNote: es.nota)
+                              warnings: avisos, dayStatus: es.estado, dayNote: es.nota,
+                              teacherFilter: docentesIds.map { Array($0) })
           }
 
           // MARK: - Validación
@@ -954,6 +976,12 @@ jobs:
               var out: [Hallazgo] = []
               let hist = buildHistory(data.schedules, before: s.weekStart, excluding: s.id)
               let zonasActivas = data.zones.filter { $0.active }
+              // Si la semana se generó con filtro de docentes, solo esos docentes cuentan en la validación
+              var docentesVal = data.teachers
+              if let f = s.teacherFilter {
+                  let sel = Set(f)
+                  docentesVal = data.teachers.filter { sel.contains($0.id) }
+              }
 
               func docente(_ id: UUID?) -> Teacher? {
                   guard let id = id else { return nil }
@@ -964,6 +992,9 @@ jobs:
               func agregar(_ n: Nivel, _ t: String) { out.append(Hallazgo(nivel: n, texto: t)) }
 
               for w in s.warnings { agregar(.aviso, w) }
+              if s.teacherFilter != nil {
+                  agregar(.ok, "Programación generada solo para los \(docentesVal.filter { $0.active }.count) docentes seleccionados.")
+              }
 
               for d in 0..<5 {
                   if s.estado(d) == 1 {
@@ -1089,7 +1120,7 @@ jobs:
                   if let a = r.a { cuenta[a, default: 0] += 1 }
                   if let b = r.b { cuenta[b, default: 0] += 1 }
               }
-              let activos = data.teachers.filter { $0.active && $0.modo != 2 }
+              let activos = docentesVal.filter { $0.active && $0.modo != 2 }
               var equilibrado = true
               if activos.count > 1 {
                   let vals = activos.map { cuenta[$0.id] ?? 0 }
@@ -1103,7 +1134,7 @@ jobs:
               // 8. Cobertura de zonas
               problemas = 0
               for d in 0..<5 where s.estado(d) != 1 {
-                  let hay = data.teachers.contains(where: { $0.active && $0.day == d && $0.modo != 1 })
+                  let hay = docentesVal.contains(where: { $0.active && $0.day == d && $0.modo != 1 })
                   if !hay {
                       problemas += 1
                       agregar(.aviso, "No hay docentes con día fijo el \(diasNombre[d].lowercased()): las zonas quedan sin cobertura.")
@@ -1120,7 +1151,7 @@ jobs:
               if problemas == 0 { agregar(.ok, "Todas las zonas activas tienen cobertura los días de acompañamiento.") }
 
               // 9. Redistribución por días no lectivos
-              let resumen = analizarRedistribucion(estados: (0..<5).map { s.estado($0) }, docentes: data.teachers.filter { $0.active })
+              let resumen = analizarRedistribucion(estados: (0..<5).map { s.estado($0) }, docentes: docentesVal.filter { $0.active })
               if !resumen.diasNoLectivos.isEmpty {
                   for h in hallazgosRedistribucion(resumen) { out.append(h) }
                   if !resumen.aptos.isEmpty && !resumen.diasConRonda.isEmpty {
@@ -1328,6 +1359,47 @@ jobs:
               return rep
           }
 
+          // Prueba del filtro de docentes: la programación debe corresponder exactamente a los seleccionados.
+          func pruebaFiltroDocentes(_ base: AppData) -> [String] {
+              var rep: [String] = ["", "▶︎ Filtro de docentes (15 de 20 seleccionados, 4 semanas)"]
+              var d = datosDePrueba([4, 4, 4, 4, 4], base)
+              var elegidos = Set<UUID>()
+              var porDia: [Int: Int] = [:]
+              for t in d.teachers {
+                  if porDia[t.day, default: 0] < 3 {
+                      elegidos.insert(t.id)
+                      porDia[t.day, default: 0] += 1
+                  }
+              }
+              let inicio = mondayOf(Date())
+              var fuera = 0
+              var duplicados = 0
+              var distintos = 0
+              var errores = 0
+              for w in 0..<4 {
+                  var s = generarSemana(d, weekStart: addDays(inicio, 7 * w), jornada: d.settings.jornada, docentesIds: elegidos)
+                  s.published = true
+                  for a in s.assignments where !elegidos.contains(a.teacherId) { fuera += 1 }
+                  for r in s.rondas {
+                      for id in [r.a, r.b] {
+                          if let x = id, !elegidos.contains(x) { fuera += 1 }
+                      }
+                  }
+                  let ids = s.assignments.map { $0.teacherId }
+                  if Set(ids).count != ids.count { duplicados += 1 }
+                  if Set(ids) != elegidos { distintos += 1 }
+                  d.schedules.append(s)
+                  errores += validar(s, d).filter { $0.nivel == .error }.count
+              }
+              rep.append(fuera == 0 ? "✅ Solo aparecen docentes seleccionados (zonas y ronda general)." : "❌ \(fuera) asignaciones de docentes no seleccionados.")
+              rep.append(duplicados == 0 ? "✅ Sin docentes duplicados en la programación." : "❌ \(duplicados) semanas con docentes duplicados.")
+              rep.append(distintos == 0 ? "✅ Cada docente seleccionado quedó programado en su día." : "❌ \(distintos) semanas no coinciden con la selección.")
+              rep.append(errores == 0 ? "✅ Sin errores de validación con filtro." : "❌ \(errores) errores de validación con filtro.")
+              let completa = generarSemana(datosDePrueba([4, 4, 4, 4, 4], base), weekStart: inicio, jornada: base.settings.jornada)
+              rep.append(completa.assignments.count == 20 && completa.teacherFilter == nil ? "✅ Sin filtro se programan los 20 docentes (comportamiento de siempre)." : "❌ Sin filtro no se programaron todos los docentes.")
+              return rep
+          }
+
           @MainActor
           func ejecutarPruebas(_ real: AppData) -> String {
               var lineas: [String] = ["PRUEBAS DE SIMULACIÓN (8 semanas consecutivas)"]
@@ -1347,6 +1419,7 @@ jobs:
               var conFestivos = datosDePrueba([4, 4, 4, 4, 4], real)
               conFestivos.freeDays = [0, 8, 16, 24, 32].map { FreeDay(date: addDays(inicio, $0), reason: "Festivo de prueba", scope: 0) }
               lineas.append(contentsOf: simularEscenario("Un día no lectivo en varias semanas (redistribución en la ronda general)", conFestivos, semanas: 6))
+              lineas.append(contentsOf: pruebaFiltroDocentes(real))
 
               if real.teachers.contains(where: { $0.active }) {
                   lineas.append(contentsOf: simularEscenario("Tus docentes registrados", real))
@@ -2278,6 +2351,170 @@ jobs:
               }
           }
 
+          // MARK: - Selector de docentes (filtro opcional para generar)
+
+          func textoNormalizado(_ s: String) -> String {
+              return s.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: Locale(identifier: "es_CO"))
+          }
+
+          struct SelectorDocentes: View {
+              @EnvironmentObject var store: Store
+              @State private var abierto = false
+              @State private var busqueda = ""
+
+              private var todos: [Teacher] {
+                  return store.data.teachers.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+              }
+
+              private var activosIds: Set<UUID> {
+                  return Set(store.data.teachers.filter { $0.active }.map { $0.id })
+              }
+
+              private var seleccionados: Set<UUID> {
+                  return store.filtroDocentes.intersection(activosIds)
+              }
+
+              // Búsqueda por nombre o apellido, sin distinguir tildes ni mayúsculas ("perez juan" encuentra "Juan Pérez")
+              private var visibles: [Teacher] {
+                  let tokens = textoNormalizado(busqueda).split(separator: " ").map { String($0) }
+                  if tokens.isEmpty { return todos }
+                  return todos.filter { t in
+                      let n = textoNormalizado(t.name)
+                      return tokens.allSatisfy { n.contains($0) }
+                  }
+              }
+
+              private var resumen: String {
+                  let total = activosIds.count
+                  if seleccionados.isEmpty { return "Todos los docentes (sin filtro)" }
+                  if seleccionados.count >= total { return "Todos los docentes (\(total))" }
+                  return "\(seleccionados.count) de \(total) docentes seleccionados"
+              }
+
+              private var nombresSeleccionados: String {
+                  return todos.filter { seleccionados.contains($0.id) }.map { $0.name }.joined(separator: ", ")
+              }
+
+              var body: some View {
+                  VStack(alignment: .leading, spacing: 6) {
+                      Text("Docentes a programar").font(.caption).foregroundColor(.secondary)
+                      HStack {
+                          Button {
+                              abierto.toggle()
+                          } label: {
+                              HStack {
+                                  Image(systemName: "person.crop.circle.badge.checkmark")
+                                  Text(resumen)
+                                  Spacer()
+                                  Image(systemName: "chevron.down").font(.caption)
+                              }
+                              .padding(.horizontal, 10)
+                              .padding(.vertical, 6)
+                              .frame(minWidth: 280, maxWidth: 420)
+                              .background(Color.gray.opacity(0.15))
+                              .cornerRadius(8)
+                              .contentShape(Rectangle())
+                          }
+                          .buttonStyle(.plain)
+                          .popover(isPresented: $abierto, arrowEdge: .bottom) { panel }
+                          if !seleccionados.isEmpty {
+                              Button("Quitar filtro") { store.filtroDocentes = [] }
+                          }
+                          Spacer()
+                      }
+                      if !seleccionados.isEmpty && seleccionados.count < activosIds.count {
+                          Text(nombresSeleccionados)
+                              .font(.caption)
+                              .foregroundColor(.secondary)
+                              .lineLimit(2)
+                          Text("La programación se generará solo para estos docentes; el resto de las reglas no cambia.")
+                              .font(.caption)
+                              .foregroundColor(.orange)
+                      } else {
+                          Text("Sin selección se programan todos los docentes habilitados.")
+                              .font(.caption)
+                              .foregroundColor(.secondary)
+                      }
+                  }
+              }
+
+              private var panel: some View {
+                  VStack(alignment: .leading, spacing: 8) {
+                      HStack {
+                          Image(systemName: "magnifyingglass")
+                          TextField("Buscar por nombre o apellido", text: $busqueda)
+                              .textFieldStyle(.roundedBorder)
+                          if !busqueda.isEmpty {
+                              Button {
+                                  busqueda = ""
+                              } label: {
+                                  Image(systemName: "xmark.circle.fill")
+                              }
+                              .buttonStyle(.plain)
+                          }
+                      }
+                      HStack {
+                          Button("Seleccionar todos") { store.filtroDocentes = activosIds }
+                          Button("Quitar todos") { store.filtroDocentes = [] }
+                          if !busqueda.isEmpty {
+                              Button("Agregar resultados") {
+                                  store.filtroDocentes.formUnion(visibles.filter { $0.active }.map { $0.id })
+                              }
+                          }
+                          Spacer()
+                      }
+                      .controlSize(.small)
+                      Text("\(seleccionados.count) seleccionados · \(visibles.count) mostrados")
+                          .font(.caption)
+                          .foregroundColor(.secondary)
+                      Divider()
+                      if visibles.isEmpty {
+                          Text("Ningún docente coincide con la búsqueda.").foregroundColor(.secondary)
+                      }
+                      ScrollView {
+                          LazyVStack(alignment: .leading, spacing: 2) {
+                              ForEach(visibles) { t in
+                                  fila(t)
+                              }
+                          }
+                      }
+                      HStack {
+                          Spacer()
+                          Button("Listo") { abierto = false }
+                              .keyboardShortcut(.defaultAction)
+                      }
+                  }
+                  .padding(14)
+                  .frame(width: 380, height: 440)
+              }
+
+              private func fila(_ t: Teacher) -> some View {
+                  let marcado = store.filtroDocentes.contains(t.id) && t.active
+                  return Button {
+                      if store.filtroDocentes.contains(t.id) {
+                          store.filtroDocentes.remove(t.id)
+                      } else {
+                          store.filtroDocentes.insert(t.id)
+                      }
+                  } label: {
+                      HStack(spacing: 8) {
+                          Image(systemName: marcado ? "checkmark.square.fill" : "square")
+                              .foregroundColor(marcado ? .accentColor : .secondary)
+                          Text(t.name).frame(maxWidth: .infinity, alignment: .leading)
+                          Text(t.active ? (t.modo == 1 ? "Solo ronda" : diasNombre[t.day]) : "Inactivo")
+                              .font(.caption)
+                              .foregroundColor(.secondary)
+                      }
+                      .padding(.vertical, 3)
+                      .padding(.horizontal, 4)
+                      .contentShape(Rectangle())
+                  }
+                  .buttonStyle(.plain)
+                  .disabled(!t.active)
+                  .opacity(t.active ? 1 : 0.5)
+              }
+          }
+
           // MARK: - Generar programación
 
           struct GenerarView: View {
@@ -2315,9 +2552,10 @@ jobs:
                                   }
                                   Text(etiquetaSemanaTexto)
                                       .foregroundColor(.secondary)
-                                  Text("\(store.data.teachers.filter { $0.active }.count) docentes habilitados · \(store.data.zones.filter { $0.active }.count) zonas activas · \(novedades) novedades esta semana · \(diasLibres) días sin acompañamiento o sin ronda")
+                                  Text("\(docentesParaGenerar.count) docentes \(filtroEfectivo != nil ? "seleccionados de \(store.data.teachers.filter { $0.active }.count) habilitados" : "habilitados") · \(store.data.zones.filter { $0.active }.count) zonas activas · \(novedades) novedades esta semana · \(diasLibres) días sin acompañamiento o sin ronda")
                                       .font(.caption)
                                       .foregroundColor(.secondary)
+                                  SelectorDocentes()
                                   Button {
                                       generar()
                                   } label: {
@@ -2402,7 +2640,7 @@ jobs:
 
               private var novedades: Int {
                   var n = 0
-                  for t in store.data.teachers where t.active {
+                  for t in docentesParaGenerar {
                       for d in 0..<5 {
                           if isAbsent(t, on: addDays(semana, d)) { n += 1 }
                       }
@@ -2417,7 +2655,18 @@ jobs:
 
               private var resumenSemana: ResumenRedistribucion {
                   let es = estadosDeSemana(store.data, mondayOf(semana))
-                  return analizarRedistribucion(estados: es.estado, docentes: store.data.teachers.filter { $0.active })
+                  return analizarRedistribucion(estados: es.estado, docentes: docentesParaGenerar)
+              }
+
+              // Filtro de docentes del panel (nil = todos los habilitados, comportamiento de siempre)
+              private var filtroEfectivo: Set<UUID>? {
+                  return filtroDocentesEfectivo(store.data, store.filtroDocentes)
+              }
+
+              private var docentesParaGenerar: [Teacher] {
+                  let activos = store.data.teachers.filter { $0.active }
+                  guard let f = filtroEfectivo else { return activos }
+                  return activos.filter { f.contains($0.id) }
               }
 
               private func generar() {
@@ -2430,7 +2679,7 @@ jobs:
                       }
                       store.data.schedules.removeAll { $0.id == ex.id }
                   }
-                  let nueva = generarSemana(store.data, weekStart: lunes, jornada: store.data.settings.jornada)
+                  let nueva = generarSemana(store.data, weekStart: lunes, jornada: store.data.settings.jornada, docentesIds: filtroEfectivo)
                   store.data.schedules.append(nueva)
                   seleccionId = nueva.id
               }
